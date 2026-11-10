@@ -7,6 +7,7 @@ import re
 from io import BytesIO
 from datetime import date
 from xhtml2pdf import pisa
+from groq import Groq
 
 # ==============================================================================
 # PAGE CONFIGURATION
@@ -49,6 +50,7 @@ def sanitize_for_pdf(text: str) -> str:
         "‘": "'",
         "…": "...",
         "\u00a0": " ",
+        "\u200b": "",  # zero-width space
     }
     for old, new in replacements.items():
         text = text.replace(old, new)
@@ -107,7 +109,6 @@ def load_and_clean_data(file):
     else:
         df['Clean_Date'] = pd.to_datetime('today')
 
-    # Garage
     garage_cols = ['Garage Spaces', 'Garage Total', 'Garage']
     found_gar = next((c for c in garage_cols if c in df.columns), None)
     df['Clean_Garage'] = df[found_gar].apply(clean_currency) if found_gar else 0.0
@@ -280,8 +281,6 @@ def calculate_grid_adjustments(comps_df, subject, reg_params):
 # ==============================================================================
 # GROQ NARRATIVE GENERATOR
 # ==============================================================================
-from groq import Groq
-
 def generate_narrative_groq(api_key, subject, reg_params, grid_df):
     clean_key = str(api_key).strip().strip('"').strip("'")
     if not clean_key or not clean_key.startswith("gsk_"):
@@ -302,7 +301,7 @@ Reconciled Price Corridor: ${min_ind:,.0f} to ${max_ind:,.0f} (Midpoint: ${midpo
 Selected Comparables Grid:
 {grid_df[['address', 'subdivision', 'price', 'gla', 'net_pct', 'gross_pct', 'indicated']].to_string()}
 
-Draft two professional appraisal narrative sections formatted in clean, standard HTML (use <p>, <b>, <ul>, and <li> tags; DO NOT use markdown asterisks ** or *):
+Draft two professional appraisal narrative sections formatted in clean, standard HTML (use <p>, <b>, <ul>, and <li> tags; DO NOT use markdown asterisks):
 1. Executive Pricing Strategy & Valuation Thesis: Reconcile the corridor, midpoint, statistical benchmark, and the ANSI +/- 100 SF deadband. Discuss midpoint pricing vs. pushing the upper corridor limit.
 2. ANSI Z765 & Comp Bracketing Defense: Explain how the selected comparables establish Fannie Mae / ANSI two-sided bracketing across GLA, price, and location.
 Keep the analysis authoritative and complete, but concise (under 400 words total) so it fits neatly on Page 1.
@@ -317,38 +316,14 @@ Keep the analysis authoritative and complete, but concise (under 400 words total
         "4. Use plain standard ASCII keyboard characters only."
     )
 
-    # 1. Fetch available models and filter strictly to Llama text models (excluding guard, whisper, vision, preview, and third-party)
-    candidate_models = []
-    try:
-        all_models = [m.id for m in client.models.list().data]
-        candidate_models = [
-            m for m in all_models 
-            if "llama" in m.lower() and not any(b in m.lower() for b in ["guard", "whisper", "vision", "embed", "orpheus"])
-        ]
-    except Exception:
-        pass
-
-    # Ensure prioritized standard production models are checked first
-    priority = [
+    # Active production models on Groq (strictly avoiding decommissioned models)
+    active_models = [
         "llama-3.3-70b-versatile",
-        "llama-3.1-70b-versatile",
-        "llama3-70b-8192",
-        "llama-3.1-8b-instant",
-        "llama3-8b-8192"
+        "llama-3.1-8b-instant"
     ]
-    
-    # Build ordered model search list
-    models_to_attempt = [m for m in priority if m in candidate_models]
-    for m in candidate_models:
-        if m not in models_to_attempt:
-            models_to_attempt.append(m)
-            
-    if not models_to_attempt:
-        models_to_attempt = priority
 
-    # 2. Iterate through candidates until one generates successfully
-    last_err = ""
-    for model_name in models_to_attempt:
+    last_error = ""
+    for model_name in active_models:
         try:
             response = client.chat.completions.create(
                 model=model_name,
@@ -361,13 +336,10 @@ Keep the analysis authoritative and complete, but concise (under 400 words total
             )
             return sanitize_for_pdf(response.choices[0].message.content)
         except Exception as e:
-            last_err = str(e)
+            last_error = str(e)
             continue
 
-    return f"<p>Algorithmic narrative generation completed based on verified market extractions and ANSI bracketing standards. (Details: {last_err})</p>"
-
-
-
+    return f"<p>Algorithmic narrative generation completed based on verified market extractions and ANSI bracketing standards. (Details: {last_error})</p>"
 
 # ==============================================================================
 # AUDIT-GRADE PDF EXPORT
@@ -375,7 +347,6 @@ Keep the analysis authoritative and complete, but concise (under 400 words total
 def build_pdf_report(subject, reg_params, grid_df, narrative_text):
     clean_narrative = sanitize_for_pdf(narrative_text)
     
-    # Convert any lingering markdown bolding or list markers to HTML if present
     clean_narrative = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', clean_narrative)
     clean_narrative = re.sub(r'^\s*\*\s+(.*?)$', r'<li>\1</li>', clean_narrative, flags=re.MULTILINE)
     if '<li>' in clean_narrative and '<ul>' not in clean_narrative:
@@ -711,7 +682,7 @@ if uploaded_file is not None:
             )
 
             with st.expander("Preview Executive Appraisal Narrative", expanded=True):
-                st.write(narrative)
+                st.write(narrative, unsafe_allow_html=True)
 
             pdf_bytes = build_pdf_report(subject_data, reg_params, grid_df, narrative)
             
