@@ -351,6 +351,13 @@ Keep the analysis thorough, authoritative, and concise (under 450 words total) s
 # ==============================================================================
 def build_pdf_report(subject, reg_params, grid_df, narrative_text):
     clean_narrative = sanitize_for_pdf(narrative_text)
+    
+    # Convert any lingering markdown bolding or list markers to HTML if present
+    clean_narrative = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', clean_narrative)
+    clean_narrative = re.sub(r'^\s*\*\s+(.*?)$', r'<li>\1</li>', clean_narrative, flags=re.MULTILINE)
+    if '<li>' in clean_narrative and '<ul>' not in clean_narrative:
+        clean_narrative = clean_narrative.replace('<li>', '<ul><li>', 1) + '</ul>'
+
     min_val = int(grid_df['indicated'].min())
     max_val = int(grid_df['indicated'].max())
     midpoint = int((min_val + max_val) / 2)
@@ -364,16 +371,24 @@ def build_pdf_report(subject, reg_params, grid_df, narrative_text):
 
         table_rows_html += f"""
         <tr>
-            <td style="font-weight: bold; text-align: left;">{r['address']}<br/><span style="font-size: 7pt; color: #555;">MLS #{r['mls']} • {r['subdivision']}</span></td>
-            <td>${r['price']:,.0f}</td>
-            <td>{r['contract_date']}</td>
-            <td>{int(r['gla']):,} SF</td>
-            <td>{r['rooms']}</td>
-            <td>{gla_adj_str}</td>
-            <td>{rm_adj_str}</td>
-            <td>{gar_adj_str}</td>
-            <td>{net_adj_str}<br/><span style="font-size: 7pt; color: #555;">({r['gross_pct']}% gr / {r['net_pct']}% net)</span></td>
-            <td style="font-weight: bold; color: #1E3A8A;">${r['indicated']:,.0f}</td>
+            <td style="text-align: left; font-weight: bold; padding: 4px 3px;">
+                {r['address']}<br/>
+                <span style="font-size: 6.5pt; color: #475569; font-weight: normal;">MLS #{r['mls']} • {r['subdivision']}</span>
+            </td>
+            <td style="white-space: nowrap;">${r['price']:,.0f}</td>
+            <td style="white-space: nowrap;">{r['contract_date']}</td>
+            <td style="white-space: nowrap;">{int(r['gla']):,} SF</td>
+            <td style="white-space: nowrap;">{r['rooms']}</td>
+            <td style="white-space: nowrap;">{gla_adj_str}</td>
+            <td style="white-space: nowrap;">{rm_adj_str}</td>
+            <td style="white-space: nowrap;">{gar_adj_str}</td>
+            <td style="white-space: nowrap;">
+                {net_adj_str}<br/>
+                <span style="font-size: 6pt; color: #64748B;">({r['gross_pct']}% gr / {r['net_pct']}% net)</span>
+            </td>
+            <td style="white-space: nowrap; font-weight: bold; color: #1E3A8A; background-color: #F8FAFC;">
+                ${r['indicated']:,.0f}
+            </td>
         </tr>
         """
 
@@ -385,91 +400,107 @@ def build_pdf_report(subject, reg_params, grid_df, narrative_text):
         <style>
             @page {{
                 size: letter portrait;
-                margin: 0.4in;
+                margin: 0.35in 0.4in;
             }}
             body {{
                 font-family: Helvetica, Arial, sans-serif;
-                font-size: 8.5pt;
-                line-height: 1.35;
-                color: #222;
+                font-size: 8pt;
+                line-height: 1.3;
+                color: #1E293B;
             }}
             .header-bar {{
                 background-color: #1E3A8A;
                 color: #ffffff;
-                padding: 10px 14px;
-                margin-bottom: 8px;
+                padding: 8px 12px;
+                margin-bottom: 6px;
             }}
             .header-title {{
-                font-size: 14pt;
+                font-size: 13pt;
                 font-weight: bold;
                 margin: 0;
             }}
             .header-sub {{
-                font-size: 8pt;
-                color: #E0E7FF;
+                font-size: 7.5pt;
+                color: #E2E8F0;
                 margin-top: 2px;
             }}
             .disclaimer {{
-                font-size: 6.5pt;
-                color: #555;
-                background-color: #F3F4F6;
-                padding: 6px 10px;
-                border-left: 3px solid #9CA3AF;
-                margin-bottom: 12px;
+                font-size: 6pt;
+                color: #475569;
+                background-color: #F8FAFC;
+                padding: 4px 8px;
+                border-left: 3px solid #94A3B8;
+                margin-bottom: 8px;
             }}
             .section-title {{
-                font-size: 10pt;
+                font-size: 9pt;
                 font-weight: bold;
                 color: #1E3A8A;
                 border-bottom: 1px solid #CBD5E1;
-                padding-bottom: 3px;
-                margin-top: 10px;
-                margin-bottom: 6px;
+                padding-bottom: 2px;
+                margin-top: 8px;
+                margin-bottom: 5px;
             }}
             .narrative-box {{
-                font-size: 8pt;
+                font-size: 7.5pt;
+                line-height: 1.25;
                 text-align: justify;
-                margin-bottom: 10px;
+                margin-bottom: 8px;
             }}
-            table {{
+            .narrative-box p {{
+                margin: 0 0 4px 0;
+            }}
+            .narrative-box ul {{
+                margin: 2px 0 4px 14px;
+                padding: 0;
+            }}
+            .narrative-box li {{
+                margin-bottom: 2px;
+            }}
+            table.comp-grid {{
                 width: 100%;
                 border-collapse: collapse;
-                margin-top: 6px;
-                margin-bottom: 10px;
-                font-size: 7.5pt;
+                margin-top: 4px;
+                margin-bottom: 6px;
+                font-size: 7pt;
             }}
-            th {{
+            table.comp-grid th {{
                 background-color: #F1F5F9;
-                color: #1E293B;
+                color: #0F172A;
                 font-weight: bold;
-                padding: 5px 4px;
+                padding: 4px 2px;
                 border: 0.5pt solid #CBD5E1;
                 text-align: center;
             }}
-            td {{
-                padding: 5px 4px;
+            table.comp-grid td {{
+                padding: 3px 2px;
                 border: 0.5pt solid #E2E8F0;
                 text-align: center;
+                vertical-align: middle;
             }}
             .kpi-table {{
                 width: 100%;
-                margin-bottom: 8px;
+                margin-bottom: 6px;
             }}
             .kpi-box {{
                 background-color: #F8FAFC;
-                border: 1pt solid #E2E8F0;
-                padding: 6px;
+                border: 0.5pt solid #CBD5E1;
+                padding: 4px;
                 text-align: center;
             }}
             .kpi-val {{
-                font-size: 11pt;
+                font-size: 10.5pt;
                 font-weight: bold;
                 color: #1E3A8A;
             }}
             .kpi-lbl {{
-                font-size: 6.5pt;
+                font-size: 6pt;
                 color: #64748B;
                 text-transform: uppercase;
+                font-weight: bold;
+            }}
+            .page-break {{
+                page-break-before: always;
             }}
         </style>
     </head>
@@ -494,23 +525,25 @@ def build_pdf_report(subject, reg_params, grid_df, narrative_text):
 
         <div class="section-title">1. Executive Pricing Strategy & Valuation Narrative</div>
         <div class="narrative-box">
-            {clean_narrative.replace(chr(10), '<br/>')}
+            {clean_narrative}
         </div>
 
+        <div class="page-break"></div>
+
         <div class="section-title">2. Sales Comparison Approach Reconciliation Grid (ANSI Z765 Bracketing)</div>
-        <table>
+        <table class="comp-grid">
             <thead>
                 <tr>
-                    <th style="width: 24%; text-align: left;">Comparable Property</th>
-                    <th>Closed Price</th>
-                    <th>Date</th>
-                    <th>GLA</th>
-                    <th>Beds/Baths</th>
-                    <th>GLA Adj ($)</th>
-                    <th>Room Adj ($)</th>
-                    <th>Garage Adj ($)</th>
-                    <th>Net Adj ($)</th>
-                    <th>Indicated Value</th>
+                    <th style="width: 25%; text-align: left;">Comparable Property</th>
+                    <th style="width: 8%;">Closed Price</th>
+                    <th style="width: 8%;">Date</th>
+                    <th style="width: 7%;">GLA</th>
+                    <th style="width: 8%;">Beds/Baths</th>
+                    <th style="width: 8%;">GLA Adj ($)</th>
+                    <th style="width: 8%;">Room Adj ($)</th>
+                    <th style="width: 8%;">Garage Adj ($)</th>
+                    <th style="width: 10%;">Net Adj ($)</th>
+                    <th style="width: 10%;">Indicated Value</th>
                 </tr>
             </thead>
             <tbody>
