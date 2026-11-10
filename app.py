@@ -542,7 +542,7 @@ with st.sidebar:
     st.header("3. Comparable Selection Mode")
     comp_mode = st.radio("Selection Strategy:", ["Algorithmic (Appraisal Bracketing)", "Manual Override (Pick Specific Comps)"])
     
-   st.header("4. Inference Provider")
+    st.header("4. Inference Provider")
     groq_api_key = st.text_input(
         "Groq API Key:", 
         value=st.secrets.get("GROQ_API_KEY", ""), 
