@@ -281,7 +281,6 @@ def calculate_grid_adjustments(comps_df, subject, reg_params):
 # GROQ NARRATIVE GENERATOR
 # ==============================================================================
 from groq import Groq
-from groq import Groq
 
 def generate_narrative_groq(api_key, subject, reg_params, grid_df):
     clean_key = str(api_key).strip().strip('"').strip("'")
@@ -306,7 +305,7 @@ Selected Comparables Grid:
 Draft two professional appraisal narrative sections formatted in clean, standard HTML (use <p>, <b>, <ul>, and <li> tags; DO NOT use markdown asterisks ** or *):
 1. Executive Pricing Strategy & Valuation Thesis: Reconcile the corridor, midpoint, statistical benchmark, and the ANSI +/- 100 SF deadband. Discuss midpoint pricing vs. pushing the upper corridor limit.
 2. ANSI Z765 & Comp Bracketing Defense: Explain how the selected comparables establish Fannie Mae / ANSI two-sided bracketing across GLA, price, and location.
-Keep the analysis thorough, authoritative, and concise (under 450 words total) so it fits seamlessly on the report page without truncating.
+Keep the analysis authoritative and complete, but concise (under 400 words total) so it fits neatly on Page 1.
 """
 
     system_msg = (
@@ -318,19 +317,37 @@ Keep the analysis thorough, authoritative, and concise (under 450 words total) s
         "4. Use plain standard ASCII keyboard characters only."
     )
 
+    # 1. Fetch models and strictly filter out non-chat models (guard, whisper, vision)
     try:
-        available_models = [m.id for m in client.models.list().data]
+        all_models = [m.id for m in client.models.list().data]
+        text_models = [
+            m for m in all_models 
+            if not any(blocked in m.lower() for blocked in ["guard", "whisper", "vision", "embed", "specdec"])
+        ]
     except Exception:
-        available_models = []
+        text_models = []
 
+    # 2. Pick the best available conversation model
+    preferred = [
+        "llama-3.3-70b-versatile",
+        "llama-3.1-70b-versatile",
+        "llama3-70b-8192",
+        "llama-3.1-8b-instant",
+        "llama3-8b-8192",
+        "mixtral-8x7b-32768",
+        "gemma2-9b-it"
+    ]
+    
     target_model = None
-    for p in ["llama-3.3-70b-versatile", "llama-3.1-70b-versatile", "llama3-70b-8192", "llama3-8b-8192"]:
-        if p in available_models:
+    for p in preferred:
+        if p in text_models:
             target_model = p
             break
-    if not target_model:
-        target_model = available_models[0] if available_models else "llama-3.3-70b-versatile"
 
+    if not target_model:
+        target_model = text_models[0] if text_models else "llama-3.3-70b-versatile"
+
+    # 3. Generate completion with safe 1,500 token ceiling
     try:
         response = client.chat.completions.create(
             model=target_model,
@@ -339,7 +356,7 @@ Keep the analysis thorough, authoritative, and concise (under 450 words total) s
                 {"role": "user", "content": prompt}
             ],
             temperature=0.2,
-            max_tokens=2500
+            max_tokens=1500
         )
         return sanitize_for_pdf(response.choices[0].message.content)
     except Exception as e:
