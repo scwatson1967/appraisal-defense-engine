@@ -219,30 +219,26 @@ def select_comparables_with_subdivision(df, subject, mode="algorithmic", manual_
 # ==============================================================================
 # SALES COMPARISON GRID ADJUSTMENTS
 # ==============================================================================
-def calculate_grid_adjustments(comps_df, subject, reg_params, apply_room_adj=False):
+def calculate_grid_adjustments(comps_df, subject, reg_params):
     grid_rows = []
     gla_rate = reg_params['gla_rate']
-    fb_rate = reg_params.get('fb_adj', 7500.0)
-    hb_rate = reg_params.get('hb_adj', 3500.0)
     deadband = 100.0
 
     for _, row in comps_df.iterrows():
         price = row['Clean_Price']
         comp_gla = row['Clean_GLA']
         
-        # ANSI Z765 Deadband
+        # ANSI Z765 Deadband: +/- 100 SF receives $0 adjustment
         gla_diff = subject['gla'] - comp_gla
         gla_adj = 0.0 if abs(gla_diff) <= deadband else round(gla_diff * gla_rate, 0)
 
-        # Situational Room / Bath Adjustments (Default $0 to prevent GLA double-dipping)
-        if apply_room_adj:
-            fb_diff = subject['baths_full'] - row['Clean_FB']
-            hb_diff = subject['baths_half'] - row['Clean_HB']
-            room_adj = (fb_diff * fb_rate) + (hb_diff * hb_rate)
-        else:
-            room_adj = 0.0
+        # APPRAISER MARKET LOGIC:
+        # 1. Market does not pay more for 2.1 baths than 3.0 baths (comp is never penalized for having more baths).
+        # 2. In this price corridor, additional bedrooms (4b, 5b) and baths (3.0ba) are absorbed in the physical GLA footprint.
+        # 3. Room count adjustment is $0 to prevent double-counting.
+        room_adj = 0.0
 
-        # Garage adjustments
+        # Garage adjustments ($10,000 per bay variance)
         gar_diff = subject['garage_bays'] - row['Clean_Garage']
         gar_adj = gar_diff * 10000.0
 
