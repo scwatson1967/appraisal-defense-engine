@@ -1,0 +1,6 @@
+streamlit
+pandas
+numpy
+statsmodels
+requests
+xhtml2pdf
