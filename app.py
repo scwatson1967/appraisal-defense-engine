@@ -742,7 +742,7 @@ if uploaded_file is not None:
 
     if st.button("Generate Listing Defense Brief", type="primary", use_container_width=True):
         mode_key = "manual" if comp_mode == "Manual Override (Pick Specific Comps)" else "algorithmic"
-        comps_df = select_comparables_with_subdivision(df, subject_data, mode=mode_key, manual_mls_ids=manual_ids)
+        comps_df = select_comparables_with_subdivision(df, subject_data, reg_params, mode=mode_key, manual_mls_ids=manual_ids)
         
         if comps_df.empty:
             st.error("No valid comparables found in the uploaded dataset.")
