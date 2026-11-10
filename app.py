@@ -317,50 +317,56 @@ Keep the analysis authoritative and complete, but concise (under 400 words total
         "4. Use plain standard ASCII keyboard characters only."
     )
 
-    # 1. Fetch models and strictly filter out non-chat models (guard, whisper, vision)
+    # 1. Fetch available models and filter strictly to Llama text models (excluding guard, whisper, vision, preview, and third-party)
+    candidate_models = []
     try:
         all_models = [m.id for m in client.models.list().data]
-        text_models = [
+        candidate_models = [
             m for m in all_models 
-            if not any(blocked in m.lower() for blocked in ["guard", "whisper", "vision", "embed", "specdec"])
+            if "llama" in m.lower() and not any(b in m.lower() for b in ["guard", "whisper", "vision", "embed", "orpheus"])
         ]
     except Exception:
-        text_models = []
+        pass
 
-    # 2. Pick the best available conversation model
-    preferred = [
+    # Ensure prioritized standard production models are checked first
+    priority = [
         "llama-3.3-70b-versatile",
         "llama-3.1-70b-versatile",
         "llama3-70b-8192",
         "llama-3.1-8b-instant",
-        "llama3-8b-8192",
-        "mixtral-8x7b-32768",
-        "gemma2-9b-it"
+        "llama3-8b-8192"
     ]
     
-    target_model = None
-    for p in preferred:
-        if p in text_models:
-            target_model = p
-            break
+    # Build ordered model search list
+    models_to_attempt = [m for m in priority if m in candidate_models]
+    for m in candidate_models:
+        if m not in models_to_attempt:
+            models_to_attempt.append(m)
+            
+    if not models_to_attempt:
+        models_to_attempt = priority
 
-    if not target_model:
-        target_model = text_models[0] if text_models else "llama-3.3-70b-versatile"
+    # 2. Iterate through candidates until one generates successfully
+    last_err = ""
+    for model_name in models_to_attempt:
+        try:
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.2,
+                max_tokens=1500
+            )
+            return sanitize_for_pdf(response.choices[0].message.content)
+        except Exception as e:
+            last_err = str(e)
+            continue
 
-    # 3. Generate completion with safe 1,500 token ceiling
-    try:
-        response = client.chat.completions.create(
-            model=target_model,
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.2,
-            max_tokens=1500
-        )
-        return sanitize_for_pdf(response.choices[0].message.content)
-    except Exception as e:
-        return f"<p>Algorithmic narrative generation completed based on verified market extractions and ANSI bracketing standards. (Details: {str(e)})</p>"
+    return f"<p>Algorithmic narrative generation completed based on verified market extractions and ANSI bracketing standards. (Details: {last_err})</p>"
+
+
 
 
 # ==============================================================================
