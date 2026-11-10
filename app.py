@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import statsmodels.api as sm
-import requests
 import re
 from io import BytesIO
 from datetime import date
@@ -166,7 +165,7 @@ def run_regression_analysis(df, subject):
     }
 
 # ==============================================================================
-# COMPARABLE SELECTION (PRIORITIZING SUBDIVISION & BRACKETING)
+# COMPARABLE SELECTION (SUBDIVISION PRIORITY + ANSI BRACKETING)
 # ==============================================================================
 def select_comparables_with_subdivision(df, subject, mode="algorithmic", manual_mls_ids=None):
     df_pool = df.copy()
@@ -281,8 +280,6 @@ def calculate_grid_adjustments(comps_df, subject, reg_params):
 # ==============================================================================
 # GROQ NARRATIVE GENERATOR
 # ==============================================================================
-from groq import Groq
-
 def generate_narrative_groq(api_key, subject, reg_params, grid_df):
     clean_key = str(api_key).strip().strip('"').strip("'")
     if not clean_key or not clean_key.startswith("gsk_"):
@@ -340,7 +337,8 @@ Do not repeat section titles, do not repeat sentences, and keep total length bet
         )
         return sanitize_for_pdf(response.choices[0].message.content)
     except Exception as e:
-        return f"<p>Algorithmic narrative generation completed based on verified market extractions and ANSI bracketing standards. (Details: {str(e)})</p>"
+        return f"<p>Direct call to llama-3.3-70b-versatile failed: {str(e)}</p>"
+
 # ==============================================================================
 # AUDIT-GRADE PDF EXPORT
 # ==============================================================================
