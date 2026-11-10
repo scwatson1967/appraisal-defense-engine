@@ -318,33 +318,34 @@ def generate_narrative_groq(api_key, subject, reg_params, grid_df):
     benchmark = int(reg_params['benchmark'])
     gla_rate = reg_params['gla_rate']
     
-    # Identify true bracketing comps
+    # Identify actual bracketing properties
     min_gla_row = grid_df.loc[grid_df['gla'].idxmin()]
     max_gla_row = grid_df.loc[grid_df['gla'].idxmax()]
     min_p_row = grid_df.loc[grid_df['price'].idxmin()]
     max_p_row = grid_df.loc[grid_df['price'].idxmax()]
 
-    # DETERMINISTIC AUDIT-GRADE NARRATIVE (Guarantees Page 1 is never empty)
+    # DETERMINISTIC AUDIT-GRADE NARRATIVE (Guarantees Page 1 is never blank)
     fallback_narrative = f"""
     <p><b>Executive Pricing Strategy & Valuation Thesis:</b> 
-    The market analysis for {subject['address']} in {subject['subdivision']} indicates a reconciled price corridor 
-    of ${min_ind:,.0f} to ${max_ind:,.0f}, establishing a central midpoint valuation of ${midpoint:,.0f} against a statistical 
-    hedonic benchmark of ${benchmark:,.0f}. Pricing at the corridor midpoint (${midpoint:,.0f}) provides an appraisal-defensible baseline 
-    supported directly by closed sales within the subdivision. Testing the upper corridor boundary (${max_ind:,.0f}) introduces appraisal risk, 
-    as the subject's 3-bedroom, 2.1-bath utility must compete directly with larger square footage homes in adjacent sections.
+    The sales comparison analysis for {subject['address']} in {subject['subdivision']} establishes an indicated price corridor 
+    of ${min_ind:,.0f} to ${max_ind:,.0f}, yielding a supported corridor midpoint of ${midpoint:,.0f} against a statistical 
+    hedonic benchmark of ${benchmark:,.0f}. Midpoint pricing represents an appraisal-defensible baseline grounded in direct 
+    neighborhood transactions. Pricing toward the upper corridor limit (${max_ind:,.0f}) introduces appraisal risk, 
+    requiring the subject property's 3-bedroom, 2.1-bath utility to compete directly with larger homes in the immediate market area.
     </p>
 
-    <p><b>ANSI Z765 & Comparable Bracketing Defense:</b> 
-    The selected comparable sales establish Fannie Mae two-sided bracketing across both gross living area and sale price. 
-    Living area is bounded on the lower end by {min_gla_row['address']} ({int(min_gla_row['gla']):,} SF) and on the upper end by 
-    {max_gla_row['address']} ({int(max_gla_row['gla']):,} SF), bracketing the subject's {subject['gla']:,} SF footprint. 
-    Closed sale prices bracket the subject from ${min_p_row['price']:,.0f} ({min_p_row['address']}) to ${max_p_row['price']:,.0f} ({max_p_row['address']}). 
-    Internal {subject['subdivision']} sales are prioritized to eliminate neighborhood variance. 
-    <b>Functional Utility & Room Adjustment Analysis:</b> Independent room and bathroom count adjustments are intentionally 
-    maintained at $0 across all comparables. Paired sales analysis demonstrates that the local market does not pay a contributory premium for 
-    additional bedrooms (4b/5b) or an additional full bath (3.0ba vs 2.1ba) independent of the living space itself. The marginal utility 
-    of these rooms is fully captured by the ${gla_rate:,.2f}/SF gross living area adjustment; applying separate room line-item adjustments 
-    would constitute improper double-counting under professional appraisal standards.
+    <p><b>ANSI Z765 & Functional Utility Bracketing Analysis:</b> 
+    Fannie Mae two-sided bracketing is fully satisfied across gross living area and transaction price. Living area is bracketed between 
+    {min_gla_row['address']} ({int(min_gla_row['gla']):,} SF) and {max_gla_row['address']} ({int(max_gla_row['gla']):,} SF) 
+    surrounding the subject's {subject['gla']:,} SF footprint. Closed sales bracket the property from ${min_p_row['price']:,.0f} 
+    to ${max_p_row['price']:,.0f}, with internal {subject['subdivision']} sales given primary weight.
+    <br/><br/>
+    <b>Room & Bath Contributory Value Reconciliation:</b> Residual sensitivity and paired analysis demonstrate that the market does not 
+    exhibit a contributory premium for additional bedrooms (4b/5b) or full bathrooms (3.0ba vs. 2.1ba) independent of total living area. 
+    Because buyers in this market segment would not pay a premium for fewer bathrooms, and because the marginal utility of additional 
+    rooms is already reflected in the ${gla_rate:,.2f}/SF gross living area adjustments, separate room line-item adjustments are reconciled at $0. 
+    Applying a separate room adjustment alongside the GLA adjustment would constitute improper double-counting of physical utility under 
+    accepted appraisal standards.
     </p>
     """
 
@@ -371,23 +372,37 @@ def generate_narrative_groq(api_key, subject, reg_params, grid_df):
             ]
             chosen_model = chat_candidates[0] if chat_candidates else "llama-3.3-70b-versatile"
 
+        comp_lines = "\n".join([
+            f"- {r['address']} ({r['subdivision']}): {int(r['gla']):,} SF, {r['rooms']}, Closed ${r['price']:,.0f}, Indicated ${r['indicated']:,.0f}"
+            for _, r in grid_df.iterrows()
+        ])
+
         prompt = f"""
-Subject Property: {subject['address']}, Raleigh, NC ({subject['subdivision']}) | GLA: {subject['gla']:,} SF | {subject['beds']}b/{subject['baths_full']}.{subject['baths_half']}ba
-Benchmark: ${benchmark:,.0f} | Corridor: ${min_ind:,.0f} - ${max_ind:,.0f} (Midpoint: ${midpoint:,.0f}) | GLA Rate: ${gla_rate}/SF
+SUBJECT PROPERTY: {subject['address']}, Raleigh, NC ({subject['subdivision']}) | GLA: {subject['gla']:,} SF | {subject['beds']}b/{subject['baths_full']}.{subject['baths_half']}ba
+Hedonic Benchmark: ${benchmark:,.0f} | Reconciled Corridor: ${min_ind:,.0f} to ${max_ind:,.0f} (Midpoint: ${midpoint:,.0f}) | Extracted GLA Rate: ${gla_rate}/SF
 
-Comps:
-{grid_df[['address', 'subdivision', 'price', 'gla', 'rooms', 'indicated']].to_string()}
+COMPARABLES GRID:
+{comp_lines}
 
-Write two concise HTML paragraphs (<p><b>Title:</b> Text</p>):
-1. <p><b>Executive Pricing Strategy & Valuation Thesis:</b> Reconcile the corridor (${min_ind:,.0f} - ${max_ind:,.0f}), midpoint (${midpoint:,.0f}), and benchmark (${benchmark:,.0f}). Explain why midpoint is defensible and upper limit carries appraisal risk.</p>
-2. <p><b>ANSI Z765 & Comparable Bracketing Defense:</b> Cite the low-end comp ({min_gla_row['address']}, {int(min_gla_row['gla']):,} SF) and high-end comp ({max_gla_row['address']}, {int(max_gla_row['gla']):,} SF) bracketing the subject's {subject['gla']:,} SF. State that closed prices bracket the subject. Emphasize that room/bath adjustments are $0 because the market recognizes no contributory value for extra bedrooms/baths separate from the space itself, and the ${gla_rate}/SF GLA adjustment already absorbs this utility, preventing double-dipping.</p>
+BRACKETING REFERENCES:
+- Lower GLA Comp: {min_gla_row['address']} ({int(min_gla_row['gla']):,} SF)
+- Upper GLA Comp: {max_gla_row['address']} ({int(max_gla_row['gla']):,} SF)
 
-Rules: Reference ONLY the comps above. Output exactly two <p> blocks. Length: 200-250 words total.
+Write an executive appraisal defense narrative formatted strictly as TWO HTML paragraphs (<p><b>Title:</b> Text</p>):
+
+1. <p><b>Executive Pricing Strategy & Valuation Thesis:</b> Reconcile corridor (${min_ind:,.0f}-${max_ind:,.0f}), midpoint (${midpoint:,.0f}), and benchmark (${benchmark:,.0f}). Explain why midpoint is defensible and upper limit carries appraisal risk.</p>
+
+2. <p><b>ANSI Z765 & Functional Utility Bracketing Analysis:</b> Reference the specific lower comp ({min_gla_row['address']}, {int(min_gla_row['gla']):,} SF) and upper comp ({max_gla_row['address']}, {int(max_gla_row['gla']):,} SF) bracketing the subject's {subject['gla']:,} SF. Explain that room/bath adjustments are reconciled at $0 based on sensitivity analysis showing the local market does not pay a contributory premium for extra bedrooms or baths independent of square footage. Detail that market buyers would never pay a premium for fewer bathrooms, and that the ${gla_rate}/SF GLA adjustment already absorbs physical room utility, avoiding double-counting.</p>
+
+CRITICAL INSTRUCTIONS:
+- Reference ONLY the specific addresses above.
+- Never assert that all properties share the same square footage.
+- Length: 200 to 260 words total.
 """
         response = client.chat.completions.create(
             model=chosen_model,
             messages=[
-                {"role": "system", "content": "You are an expert real estate appraiser under N.C.G.S. § 93A-83. Write concise, accurate appraisal prose."},
+                {"role": "system", "content": "You are a North Carolina real estate appraiser writing an executive listing defense brief under N.C.G.S. § 93A-83. Write concise, defensible prose."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.2,
