@@ -281,11 +281,12 @@ def calculate_grid_adjustments(comps_df, subject, reg_params):
 # GROQ NARRATIVE GENERATOR
 # ==============================================================================
 from groq import Groq
+from groq import Groq
 
 def generate_narrative_groq(api_key, subject, reg_params, grid_df):
     clean_key = str(api_key).strip().strip('"').strip("'")
     if not clean_key or not clean_key.startswith("gsk_"):
-        return "Narrative generation bypassed: Missing or invalid Groq API key in Secrets."
+        return "Narrative generation bypassed: Missing or invalid Groq API key."
 
     client = Groq(api_key=clean_key)
 
@@ -307,42 +308,56 @@ Draft two formal appraisal defense sections:
 2. ANSI Z765 & Comp Bracketing Defense: Explain how the selected comparables establish Fannie Mae / ANSI two-sided bracketing across GLA, price, and location.
 """
 
-    models_to_try = [
+    system_msg = (
+        "You are a master real estate appraiser writing an appraisal review brief under N.C.G.S. § 93A-83. "
+        "CRITICAL FORMATTING RULES: "
+        "1. Never use LaTeX syntax or math delimiters ($...$ or $$...$$). "
+        "2. Never use the ± symbol; write '+/-'. "
+        "3. Do not use en-dashes, em-dashes, or Greek letters. "
+        "4. Use plain standard ASCII keyboard characters only."
+    )
+
+    # 1. Fetch available models for this specific API key
+    try:
+        available_models = [m.id for m in client.models.list().data]
+    except Exception:
+        available_models = []
+
+    # 2. Select the best match from available models
+    target_model = None
+    priority_order = [
         "llama-3.3-70b-versatile",
         "llama-3.1-70b-versatile",
         "llama3-70b-8192",
-        "llama-3.1-8b-instant"
+        "llama-3.1-8b-instant",
+        "llama3-8b-8192",
+        "gemma2-9b-it",
+        "mixtral-8x7b-32768"
     ]
+    for p in priority_order:
+        if p in available_models:
+            target_model = p
+            break
 
-    last_error = ""
-    for model_name in models_to_try:
-        try:
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a master real estate appraiser writing an appraisal review brief under N.C.G.S. § 93A-83. "
-                            "CRITICAL FORMATTING RULES: "
-                            "1. Never use LaTeX syntax or math delimiters ($...$ or $$...$$). "
-                            "2. Never use the ± symbol; write '+/-'. "
-                            "3. Do not use en-dashes, em-dashes, or Greek letters. "
-                            "4. Use plain standard ASCII keyboard characters only."
-                        )
-                    },
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.2,
-                max_tokens=1200
-            )
-            narrative = response.choices[0].message.content
-            return sanitize_for_pdf(narrative)
-        except Exception as e:
-            last_error = str(e)
-            continue
+    # If none of the preferred models match, use the first text model in the account
+    if not target_model:
+        target_model = available_models[0] if available_models else "llama-3.3-70b-versatile"
 
-    return f"Algorithmic narrative generation completed based on verified market extractions and ANSI bracketing standards. (Details: {last_error})"
+    # 3. Generate completion
+    try:
+        response = client.chat.completions.create(
+            model=target_model,
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.2,
+            max_tokens=1200
+        )
+        return sanitize_for_pdf(response.choices[0].message.content)
+    except Exception as e:
+        return f"Algorithmic narrative generation completed based on verified market extractions and ANSI bracketing standards. (Details: {str(e)})"
+
 
 # ==============================================================================
 # AUDIT-GRADE PDF EXPORT
