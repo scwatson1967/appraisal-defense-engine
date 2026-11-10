@@ -4,3 +4,4 @@ numpy
 statsmodels
 requests
 xhtml2pdf
+groq
