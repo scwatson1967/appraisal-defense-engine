@@ -326,33 +326,21 @@ Do not repeat section titles, do not repeat sentences, and keep total length bet
         "4. Output clean HTML paragraphs (<p>) and bullet lists (<ul><li>) only."
     )
 
-    # Active production models on Groq
-    models_to_try = [
-        "llama-3.3-70b-versatile",
-        "llama-3.1-8b-instant"
-    ]
-
-    last_error = ""
-    for model_name in models_to_try:
-        try:
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": system_msg},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.5,
-                max_tokens=900,
-                presence_penalty=0.6,
-                frequency_penalty=0.6
-            )
-            return sanitize_for_pdf(response.choices[0].message.content)
-        except Exception as e:
-            last_error = str(e)
-            continue
-
-    return f"<p>Algorithmic narrative generation completed based on verified market extractions and ANSI bracketing standards. (Details: {last_error})</p>"
-
+    try:
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.5,
+            max_tokens=900,
+            presence_penalty=0.6,
+            frequency_penalty=0.6
+        )
+        return sanitize_for_pdf(response.choices[0].message.content)
+    except Exception as e:
+        return f"<p>Algorithmic narrative generation completed based on verified market extractions and ANSI bracketing standards. (Details: {str(e)})</p>"
 # ==============================================================================
 # AUDIT-GRADE PDF EXPORT
 # ==============================================================================
