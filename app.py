@@ -291,23 +291,20 @@ def generate_narrative_groq(api_key, subject, reg_params, grid_df):
 
     client = Groq(api_key=clean_key)
 
-    # 1. Ask Groq for the EXACT models permitted for this key
+    # 1. Fetch available text chat model
     try:
         models_data = client.models.list().data
         active_ids = [m.id for m in models_data]
     except Exception as e:
         return f"<p>Could not fetch model list from Groq: {str(e)}</p>"
 
-    # 2. Filter out non-chat tools (guard, whisper, embed)
     chat_candidates = [
         m_id for m_id in active_ids 
         if not any(blocked in m_id.lower() for blocked in ["guard", "whisper", "vision", "embed", "orpheus"])
     ]
-
     if not chat_candidates:
-        return f"<p>No standard text chat models found. Full model list on your key: {active_ids}</p>"
+        return f"<p>No standard text chat models found. Account models: {active_ids}</p>"
 
-    # Pick the first approved text model from your account
     chosen_model = chat_candidates[0]
 
     min_ind = int(grid_df['indicated'].min())
@@ -321,29 +318,23 @@ Extracted Marginal GLA Rate: ${reg_params['gla_rate']}/SF with ANSI +/- 100 SF d
 Reconciled Price Corridor: ${min_ind:,.0f} to ${max_ind:,.0f} (Midpoint: ${midpoint:,.0f}).
 
 Selected Comparables Grid:
-{grid_df[['address', 'subdivision', 'price', 'gla', 'net_pct', 'gross_pct', 'indicated']].to_string()}
+{grid_df[['address', 'subdivision', 'price', 'gla', 'rooms', 'net_pct', 'gross_pct', 'indicated']].to_string()}
 
-Write a concise two-part valuation brief in clean HTML (use <p>, <b>, <ul>, and <li> tags; DO NOT use markdown asterisks **):
+Write an executive valuation narrative formatted strictly as TWO concise HTML paragraphs (<p><b>Title:</b> Text</p>):
 
-PART 1: Executive Pricing Strategy & Valuation Thesis
-- Reconcile the corridor (${min_ind:,.0f} - ${max_ind:,.0f}), midpoint (${midpoint:,.0f}), and statistical benchmark (${reg_params['benchmark']:,.0f}).
-- Detail why midpoint pricing provides an appraisal-defensible baseline and discuss the strategic risks vs. rewards of pricing toward the upper corridor limit.
+<p><b>Executive Pricing Strategy & Valuation Thesis:</b> Reconcile the indicated price corridor (${min_ind:,.0f} to ${max_ind:,.0f}), the midpoint (${midpoint:,.0f}), and the statistical benchmark (${reg_params['benchmark']:,.0f}). Explain why midpoint pricing provides an appraisal-defensible foundation. Briefly note the risk of pricing at the upper corridor limit versus testing the market ceiling.</p>
 
-PART 2: ANSI Z765 & Comparable Bracketing Defense
-- Explain how the 4 comps bracket the subject's 2,004 SF GLA above and below.
-- Confirm how the closed sale prices establish two-sided price bracketing.
-- Highlight the prioritization of internal Chadwick subdivision sales.
+<p><b>ANSI Z765 & Comparable Bracketing Defense:</b> Explain how the four selected comparables bracket the subject property's {subject['gla']:,} SF GLA above and below, and establish two-sided price bracketing. Emphasize that internal {subject['subdivision']} sales are prioritized to minimize location variance. Note that independent room and bathroom count adjustments are set to $0 because room and bath utility differences are fully absorbed within the ${reg_params['gla_rate']}/SF marginal GLA rate, preventing double-dipping under standard appraisal methodology.</p>
 
-Do not repeat section titles, do not repeat sentences, and keep total length between 250 and 350 words so it fits comfortably on Page 1.
+STRICT CONSTRAINTS:
+1. ONLY reference the comparables provided in the grid above. DO NOT invent or mention any other street addresses or sales.
+2. DO NOT use bullet lists or extra headings. Output exactly the two <p> blocks above.
+3. Keep the total length between 200 and 260 words so it fits completely on Page 1.
 """
 
     system_msg = (
         "You are an expert North Carolina real estate appraiser writing an executive listing defense brief under N.C.G.S. § 93A-83. "
-        "CRITICAL RULES: "
-        "1. Never repeat paragraphs or section headings. "
-        "2. Do not use LaTeX syntax or math delimiters ($...$). "
-        "3. Do not use the ± symbol; write '+/-'. "
-        "4. Output clean HTML paragraphs (<p>) and bullet lists (<ul><li>) only."
+        "Write concise, authoritative, professional prose. Use plain ASCII characters only. Never use LaTeX syntax or math delimiters."
     )
 
     try:
@@ -353,14 +344,14 @@ Do not repeat section titles, do not repeat sentences, and keep total length bet
                 {"role": "system", "content": system_msg},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.5,
-            max_tokens=900,
-            presence_penalty=0.6,
-            frequency_penalty=0.6
+            temperature=0.2,
+            max_tokens=1500,
+            presence_penalty=0.3,
+            frequency_penalty=0.3
         )
         return sanitize_for_pdf(response.choices[0].message.content)
     except Exception as e:
-        return f"<p>Attempted model <b>{chosen_model}</b>. Error: {str(e)}<br/>Available models on this key: {active_ids}</p>"
+        return f"<p>Generation failed with model <b>{chosen_model}</b>: {str(e)}</p>"
 
 # ==============================================================================
 # AUDIT-GRADE PDF EXPORT
