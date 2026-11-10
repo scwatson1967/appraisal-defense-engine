@@ -696,7 +696,12 @@ if uploaded_file is not None:
         if comps_df.empty:
             st.error("No valid comparables found in the uploaded dataset.")
         else:
-            grid_df = calculate_grid_adjustments(comps_df, subject_data, reg_params)
+    grid_df = calculate_grid_adjustments(
+    comps_df, 
+    subject_data, 
+    reg_params, 
+    apply_room_adj=apply_room_adj
+)        
 
             with st.spinner("Compiling narrative via Groq Cloud..."):
                 narrative = generate_narrative_groq(groq_api_key, subject_data, reg_params, grid_df)
