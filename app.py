@@ -280,57 +280,69 @@ def calculate_grid_adjustments(comps_df, subject, reg_params):
 # ==============================================================================
 # GROQ NARRATIVE GENERATOR
 # ==============================================================================
+from groq import Groq
+
 def generate_narrative_groq(api_key, subject, reg_params, grid_df):
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
+    clean_key = str(api_key).strip().strip('"').strip("'")
+    if not clean_key or not clean_key.startswith("gsk_"):
+        return "Narrative generation bypassed: Missing or invalid Groq API key in Secrets."
+
+    client = Groq(api_key=clean_key)
 
     min_ind = int(grid_df['indicated'].min())
     max_ind = int(grid_df['indicated'].max())
     midpoint = int((min_ind + max_ind) / 2)
 
     prompt = f"""
-Subject: {subject['address']}, Raleigh, NC (Subdivision: {subject['subdivision']}, GLA: {subject['gla']} SF, Beds: {subject['beds']}, Baths: {subject['baths_full']}.{subject['baths_half']}, Garage: {subject['garage_bays']} bays, Condition: {subject['condition']}, Built: {subject['year_built']}).
-Amenities: {', '.join([k for k, v in subject['amenities'].items() if v]) or 'None'}
+Subject Property: {subject['address']}, Raleigh, NC (Subdivision: {subject['subdivision']}, GLA: {subject['gla']} SF, Beds: {subject['beds']}, Baths: {subject['baths_full']}.{subject['baths_half']}, Built: {subject['year_built']}).
 Statistical Benchmark: ${reg_params['benchmark']:,.0f}
 Extracted Marginal GLA Rate: ${reg_params['gla_rate']}/SF with ANSI +/- 100 SF deadband.
-Reconciled Indicated Price Corridor: ${min_ind:,.0f} to ${max_ind:,.0f} (Midpoint: ${midpoint:,.0f}).
+Reconciled Price Corridor: ${min_ind:,.0f} to ${max_ind:,.0f} (Midpoint: ${midpoint:,.0f}).
 
-Selected Comparables:
+Selected Comparables Grid:
 {grid_df[['address', 'subdivision', 'price', 'gla', 'net_pct', 'gross_pct', 'indicated']].to_string()}
 
-Provide two formal appraisal narrative sections:
-1. Executive Pricing Strategy & Valuation Thesis: Reconcile the calibrated corridor, midpoint, statistical benchmark, and the ANSI +/- 100 SF deadband.
-2. ANSI Z765 & Comp Bracketing Defense: Explain how the selected sales establish Fannie Mae / ANSI two-sided bracketing across GLA, price, and location.
+Draft two formal appraisal defense sections:
+1. Executive Pricing Strategy & Valuation Thesis: Reconcile the corridor, midpoint, statistical benchmark, and the ANSI +/- 100 SF deadband. Explain the trade-offs between pricing at the midpoint vs. pushing the upper bound.
+2. ANSI Z765 & Comp Bracketing Defense: Explain how the selected comparables establish Fannie Mae / ANSI two-sided bracketing across GLA, price, and location.
 """
 
-    payload = {
-        "model": "llama-3.3-70b-versatile",
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are a master real estate appraiser writing an appraisal review brief. "
-                    "CRITICAL: Do not use LaTeX math markup, dollar signs for math ($...$), or special math glyphs. "
-                    "NEVER use the ± symbol; write '+/-'. Do not use en-dashes or Greek letters. "
-                    "Use clean plain-text ASCII only."
-                )
-            },
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.2,
-        "max_tokens": 1200
-    }
+    models_to_try = [
+        "llama-3.3-70b-versatile",
+        "llama-3.1-70b-versatile",
+        "llama3-70b-8192",
+        "llama-3.1-8b-instant"
+    ]
 
-    try:
-        res = requests.post(url, json=payload, headers=headers, timeout=20)
-        res.raise_for_status()
-        text = res.json()['choices'][0]['message']['content']
-        return sanitize_for_pdf(text)
-    except Exception as e:
-        return f"Algorithmic narrative generation completed based on verified market extractions and ANSI bracketing standards. (Error: {str(e)})"
+    last_error = ""
+    for model_name in models_to_try:
+        try:
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a master real estate appraiser writing an appraisal review brief under N.C.G.S. § 93A-83. "
+                            "CRITICAL FORMATTING RULES: "
+                            "1. Never use LaTeX syntax or math delimiters ($...$ or $$...$$). "
+                            "2. Never use the ± symbol; write '+/-'. "
+                            "3. Do not use en-dashes, em-dashes, or Greek letters. "
+                            "4. Use plain standard ASCII keyboard characters only."
+                        )
+                    },
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.2,
+                max_tokens=1200
+            )
+            narrative = response.choices[0].message.content
+            return sanitize_for_pdf(narrative)
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+    return f"Algorithmic narrative generation completed based on verified market extractions and ANSI bracketing standards. (Details: {last_error})"
 
 # ==============================================================================
 # AUDIT-GRADE PDF EXPORT
