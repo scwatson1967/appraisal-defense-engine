@@ -281,12 +281,19 @@ def calculate_grid_adjustments(comps_df, subject, reg_params):
 # ==============================================================================
 # GROQ NARRATIVE GENERATOR
 # ==============================================================================
+from groq import Groq
+
 def generate_narrative_groq(api_key, subject, reg_params, grid_df):
     clean_key = str(api_key).strip().strip('"').strip("'")
     if not clean_key or not clean_key.startswith("gsk_"):
-        return "<p>Narrative generation bypassed: Missing or invalid Groq API key.</p>"
+        return "<p>Narrative generation bypassed: Missing or invalid Groq API key in Section 4.</p>"
 
-    client = Groq(api_key=clean_key)
+    try:
+        client = Groq(api_key=clean_key)
+        # Fetch the exact models active for this specific key
+        all_account_models = [m.id for m in client.models.list().data]
+    except Exception as e:
+        return f"<p>Authentication error with Groq: {str(e)}</p>"
 
     min_ind = int(grid_df['indicated'].min())
     max_ind = int(grid_df['indicated'].max())
@@ -316,30 +323,47 @@ Keep the analysis authoritative and complete, but concise (under 400 words total
         "4. Use plain standard ASCII keyboard characters only."
     )
 
-    # Active production models on Groq (strictly avoiding decommissioned models)
-    active_models = [
-        "llama-3.3-70b-versatile",
-        "llama-3.1-8b-instant"
+    # Filter out audio, safety moderation filters, and vision preview tools
+    chat_candidates = [
+        m for m in all_account_models 
+        if not any(b in m.lower() for b in ["guard", "whisper", "vision", "embed", "orpheus", "specdec"])
     ]
 
-    last_error = ""
-    for model_name in active_models:
-        try:
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": system_msg},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.2,
-                max_tokens=1500
-            )
-            return sanitize_for_pdf(response.choices[0].message.content)
-        except Exception as e:
-            last_error = str(e)
-            continue
+    # Prioritize standard LLaMA models if present in the account
+    preferred_order = [
+        "llama-3.3-70b-versatile",
+        "llama-3.1-70b-versatile",
+        "llama3-70b-8192",
+        "llama3-8b-8192",
+        "mixtral-8x7b-32768",
+        "gemma2-9b-it"
+    ]
+    
+    selected_model = None
+    for pref in preferred_order:
+        if pref in chat_candidates:
+            selected_model = pref
+            break
+            
+    if not selected_model and chat_candidates:
+        selected_model = chat_candidates[0]
 
-    return f"<p>Algorithmic narrative generation completed based on verified market extractions and ANSI bracketing standards. (Details: {last_error})</p>"
+    if not selected_model:
+        return f"<p>No compatible text chat models found for this Groq key. Account models reported: {all_account_models}</p>"
+
+    try:
+        response = client.chat.completions.create(
+            model=selected_model,
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.2,
+            max_tokens=1500
+        )
+        return sanitize_for_pdf(response.choices[0].message.content)
+    except Exception as e:
+        return f"<p>Generation failed with model <b>{selected_model}</b>. (Error: {str(e)}). Active account models: {chat_candidates}</p>"
 
 # ==============================================================================
 # AUDIT-GRADE PDF EXPORT
