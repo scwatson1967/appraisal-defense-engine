@@ -592,11 +592,7 @@ with st.sidebar:
     st.header("2. Valuation Mode & Pricing")
     val_mode = st.radio("Deliverable Strategy Mode:", ["Pre-Listing / CMA Strategy", "Executed Contract Defense"])
     val_date = st.date_input("Valuation Date:", value=date.today())
-    apply_room_adj = st.checkbox(
-        "Apply Independent Room/Bath Adjustments", 
-        value=False,
-        help="Unchecked by default: allows GLA adjustment to capture size utility without double-dipping."
-    )
+    
     
     st.header("3. Comparable Selection Mode")
     comp_mode = st.radio("Selection Strategy:", ["Algorithmic (Appraisal Bracketing)", "Manual Override (Pick Specific Comps)"])
