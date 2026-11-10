@@ -219,11 +219,11 @@ def select_comparables_with_subdivision(df, subject, mode="algorithmic", manual_
 # ==============================================================================
 # SALES COMPARISON GRID ADJUSTMENTS
 # ==============================================================================
-def calculate_grid_adjustments(comps_df, subject, reg_params):
+def calculate_grid_adjustments(comps_df, subject, reg_params, apply_room_adj=False):
     grid_rows = []
     gla_rate = reg_params['gla_rate']
-    fb_rate = reg_params['fb_adj']
-    hb_rate = reg_params['hb_adj']
+    fb_rate = reg_params.get('fb_adj', 7500.0)
+    hb_rate = reg_params.get('hb_adj', 3500.0)
     deadband = 100.0
 
     for _, row in comps_df.iterrows():
@@ -234,10 +234,13 @@ def calculate_grid_adjustments(comps_df, subject, reg_params):
         gla_diff = subject['gla'] - comp_gla
         gla_adj = 0.0 if abs(gla_diff) <= deadband else round(gla_diff * gla_rate, 0)
 
-        # Bath adjustments
-        fb_diff = subject['baths_full'] - row['Clean_FB']
-        hb_diff = subject['baths_half'] - row['Clean_HB']
-        bath_adj = (fb_diff * fb_rate) + (hb_diff * hb_rate)
+        # Situational Room / Bath Adjustments (Default $0 to prevent GLA double-dipping)
+        if apply_room_adj:
+            fb_diff = subject['baths_full'] - row['Clean_FB']
+            hb_diff = subject['baths_half'] - row['Clean_HB']
+            room_adj = (fb_diff * fb_rate) + (hb_diff * hb_rate)
+        else:
+            room_adj = 0.0
 
         # Garage adjustments
         gar_diff = subject['garage_bays'] - row['Clean_Garage']
@@ -245,11 +248,10 @@ def calculate_grid_adjustments(comps_df, subject, reg_params):
 
         # Basement adjustment
         bsmt_adj = (subject['bsmt_fin'] * 50.0)
-
         cond_adj = 0.0
 
-        net_adj = gla_adj + bath_adj + gar_adj + cond_adj + bsmt_adj
-        gross_adj = abs(gla_adj) + abs(bath_adj) + abs(gar_adj) + abs(cond_adj) + abs(bsmt_adj)
+        net_adj = gla_adj + room_adj + gar_adj + cond_adj + bsmt_adj
+        gross_adj = abs(gla_adj) + abs(room_adj) + abs(gar_adj) + abs(cond_adj) + abs(bsmt_adj)
         indicated = price + net_adj
 
         net_pct = round((net_adj / price) * 100, 1) if price > 0 else 0.0
@@ -264,7 +266,7 @@ def calculate_grid_adjustments(comps_df, subject, reg_params):
             "gla": comp_gla,
             "rooms": f"{row['Clean_Beds']}b/{row['Clean_FB']}.{row['Clean_HB']}ba",
             "gla_adj": gla_adj,
-            "room_adj": bath_adj,
+            "room_adj": room_adj,
             "gar_adj": gar_adj,
             "bsmt_adj": bsmt_adj,
             "cond_adj": cond_adj,
