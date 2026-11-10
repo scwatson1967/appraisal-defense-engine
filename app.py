@@ -542,9 +542,13 @@ with st.sidebar:
     st.header("3. Comparable Selection Mode")
     comp_mode = st.radio("Selection Strategy:", ["Algorithmic (Appraisal Bracketing)", "Manual Override (Pick Specific Comps)"])
     
-    groq_api_key = st.secrets.get("GROQ_API_KEY", "")
-    if not groq_api_key:
-        groq_api_key = st.text_input("Groq API Key (gsk_...):", type="password")
+   st.header("4. Inference Provider")
+    groq_api_key = st.text_input(
+        "Groq API Key:", 
+        value=st.secrets.get("GROQ_API_KEY", ""), 
+        type="password",
+        help="Paste your gsk_... key here"
+    )
 
 # ==============================================================================
 # MAIN INTERFACE: RESTORED 3-COLUMN PARAMETER GRID
