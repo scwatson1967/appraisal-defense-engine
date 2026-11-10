@@ -694,7 +694,7 @@ if uploaded_file is not None:
         comps_df = select_comparables_with_subdivision(df, subject_data, mode=mode_key, manual_mls_ids=manual_ids)
         
      if comps_df.empty:
-            st.error("No valid comparables found in the uploaded dataset.")
+        st.error("No valid comparables found in the uploaded dataset.")
      else:
         grid_df = calculate_grid_adjustments(comps_df, subject_data, reg_params)
 
