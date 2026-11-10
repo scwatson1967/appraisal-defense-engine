@@ -693,24 +693,34 @@ if uploaded_file is not None:
         mode_key = "manual" if comp_mode == "Manual Override (Pick Specific Comps)" else "algorithmic"
         comps_df = select_comparables_with_subdivision(df, subject_data, mode=mode_key, manual_mls_ids=manual_ids)
         
-        if comps_df.empty:
+     if comps_df.empty:
             st.error("No valid comparables found in the uploaded dataset.")
-        else:
-    grid_df = calculate_grid_adjustments(
-    comps_df, 
-    subject_data, 
-    reg_params, 
-    apply_room_adj=apply_room_adj
-)        
+     else:
+        grid_df = calculate_grid_adjustments(comps_df, subject_data, reg_params)
 
-            with st.spinner("Compiling narrative via Groq Cloud..."):
-                narrative = generate_narrative_groq(groq_api_key, subject_data, reg_params, grid_df)
+        with st.spinner("Compiling narrative via Groq Cloud..."):
+            narrative = generate_narrative_groq(groq_api_key, subject_data, reg_params, grid_df)
 
-            st.markdown("### Valuation & Grid Defense")
-            st.dataframe(
-                grid_df[['address', 'subdivision', 'price', 'gla', 'rooms', 'gla_adj', 'room_adj', 'gar_adj', 'net_adj', 'gross_pct', 'indicated']],
-                use_container_width=True
-            )
+        st.markdown("### Valuation & Grid Defense")
+        st.dataframe(
+            grid_df[['address', 'subdivision', 'price', 'gla', 'rooms', 'gla_adj', 'room_adj', 'gar_adj', 'net_adj', 'gross_pct', 'indicated']],
+            use_container_width=True
+        )
+
+        with st.expander("Preview Executive Appraisal Narrative", expanded=True):
+            st.write(narrative, unsafe_allow_html=True)
+
+        pdf_bytes = build_pdf_report(subject_data, reg_params, grid_df, narrative)
+            
+        clean_filename = f"Listing_Defense_Brief_{re.sub(r'[^a-zA-Z0-9]', '_', subj_address)}.pdf"
+        st.download_button(
+            label="📥 Download Audit-Grade Defense Brief (PDF)",
+            data=pdf_bytes,
+            file_name=clean_filename,
+            mime="application/pdf",
+            use_container_width=True
+        )
+          
 
             with st.expander("Preview Executive Appraisal Narrative", expanded=True):
                 st.write(narrative, unsafe_allow_html=True)
