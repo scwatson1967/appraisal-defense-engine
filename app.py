@@ -291,50 +291,79 @@ def generate_narrative_groq(api_key, subject, reg_params, grid_df):
 
     client = Groq(api_key=clean_key)
 
-    # 1. Fetch available text chat model
+    # 1. Inspect account models and select the strongest available text model
     try:
         models_data = client.models.list().data
         active_ids = [m.id for m in models_data]
     except Exception as e:
         return f"<p>Could not fetch model list from Groq: {str(e)}</p>"
 
-    chat_candidates = [
-        m_id for m_id in active_ids 
-        if not any(blocked in m_id.lower() for blocked in ["guard", "whisper", "vision", "embed", "orpheus"])
+    # Strictly prioritize the 70B models over lightweight 1B/8B preview models
+    preferred_models = [
+        "llama-3.3-70b-versatile",
+        "llama-3.1-70b-versatile",
+        "deepseek-r1-distill-llama-70b",
+        "mixtral-8x7b-32768",
+        "llama-3.1-8b-instant"
     ]
-    if not chat_candidates:
-        return f"<p>No standard text chat models found. Account models: {active_ids}</p>"
-
-    chosen_model = chat_candidates[0]
+    
+    chosen_model = next((m for m in preferred_models if m in active_ids), None)
+    if not chosen_model:
+        chat_candidates = [
+            m for m in active_ids 
+            if not any(b in m.lower() for b in ["guard", "whisper", "vision", "embed", "orpheus"])
+        ]
+        chosen_model = chat_candidates[0] if chat_candidates else "llama-3.3-70b-versatile"
 
     min_ind = int(grid_df['indicated'].min())
     max_ind = int(grid_df['indicated'].max())
     midpoint = int((min_ind + max_ind) / 2)
 
+    # 2. Build explicit, unambiguous factual bullets for each comp
+    comp_bullets = []
+    for _, row in grid_df.iterrows():
+        comp_bullets.append(
+            f"- {row['address']} ({row['subdivision']}): GLA {int(row['gla']):,} SF | "
+            f"Closed ${row['price']:,.0f} | Net Adj ${row['net_adj']:+,.0f} | Indicated ${row['indicated']:,.0f}"
+        )
+    comps_summary_text = "\n".join(comp_bullets)
+
+    # Identify the actual bracketing bounds in Python
+    min_gla_comp = grid_df.loc[grid_df['gla'].idxmin()]
+    max_gla_comp = grid_df.loc[grid_df['gla'].idxmax()]
+
     prompt = f"""
-Subject Property: {subject['address']}, Raleigh, NC (Subdivision: {subject['subdivision']}, GLA: {subject['gla']} SF, Beds: {subject['beds']}, Baths: {subject['baths_full']}.{subject['baths_half']}, Garage: {subject['garage_bays']} bays, Built: {subject['year_built']}).
+SUBJECT PROPERTY:
+Address: {subject['address']}, Raleigh, NC (Subdivision: {subject['subdivision']})
+Gross Living Area (GLA): {subject['gla']:,} SF
+Beds/Baths: {subject['beds']} Beds / {subject['baths_full']}.{subject['baths_half']} Baths
 Statistical Benchmark: ${reg_params['benchmark']:,.0f}
-Extracted Marginal GLA Rate: ${reg_params['gla_rate']}/SF with ANSI +/- 100 SF deadband.
-Reconciled Price Corridor: ${min_ind:,.0f} to ${max_ind:,.0f} (Midpoint: ${midpoint:,.0f}).
+Extracted Marginal GLA Rate: ${reg_params['gla_rate']}/SF with ANSI +/- 100 SF deadband
+Reconciled Corridor: ${min_ind:,.0f} to ${max_ind:,.0f} (Midpoint: ${midpoint:,.0f})
 
-Selected Comparables Grid:
-{grid_df[['address', 'subdivision', 'price', 'gla', 'rooms', 'net_pct', 'gross_pct', 'indicated']].to_string()}
+VERIFIED COMPARABLE SALES (DO NOT ALTER THESE FACTS):
+{comps_summary_text}
 
-Write an executive valuation narrative formatted strictly as TWO concise HTML paragraphs (<p><b>Title:</b> Text</p>):
+BRACKETING FACTS:
+- Low-end GLA Comp: {min_gla_comp['address']} at {int(min_gla_comp['gla']):,} SF
+- High-end GLA Comp: {max_gla_comp['address']} at {int(max_gla_comp['gla']):,} SF
 
-<p><b>Executive Pricing Strategy & Valuation Thesis:</b> Reconcile the indicated price corridor (${min_ind:,.0f} to ${max_ind:,.0f}), the midpoint (${midpoint:,.0f}), and the statistical benchmark (${reg_params['benchmark']:,.0f}). Explain why midpoint pricing provides an appraisal-defensible foundation. Briefly note the risk of pricing at the upper corridor limit versus testing the market ceiling.</p>
+TASK:
+Write an executive valuation narrative formatted strictly as TWO clean HTML paragraphs (<p><b>Title:</b> Text</p>):
 
-<p><b>ANSI Z765 & Comparable Bracketing Defense:</b> Explain how the four selected comparables bracket the subject property's {subject['gla']:,} SF GLA above and below, and establish two-sided price bracketing. Emphasize that internal {subject['subdivision']} sales are prioritized to minimize location variance. Note that independent room and bathroom count adjustments are set to $0 because room and bath utility differences are fully absorbed within the ${reg_params['gla_rate']}/SF marginal GLA rate, preventing double-dipping under standard appraisal methodology.</p>
+<p><b>Executive Pricing Strategy & Valuation Thesis:</b> Reconcile the indicated price corridor (${min_ind:,.0f} to ${max_ind:,.0f}), the midpoint (${midpoint:,.0f}), and the statistical benchmark (${reg_params['benchmark']:,.0f}). State why midpoint pricing provides an appraisal-defensible foundation, and discuss the strategic risks versus market ceiling rewards of pricing near the upper corridor limit.</p>
 
-STRICT CONSTRAINTS:
-1. ONLY reference the comparables provided in the grid above. DO NOT invent or mention any other street addresses or sales.
-2. DO NOT use bullet lists or extra headings. Output exactly the two <p> blocks above.
-3. Keep the total length between 200 and 260 words so it fits completely on Page 1.
+<p><b>ANSI Z765 & Comparable Bracketing Defense:</b> Detail how the actual comparable sales bracket the subject's {subject['gla']:,} SF GLA, specifically referencing {min_gla_comp['address']} ({int(min_gla_comp['gla']):,} SF) on the lower bound and {max_gla_comp['address']} ({int(max_gla_comp['gla']):,} SF) on the upper bound. Note that closed sale prices establish two-sided price bracketing, and highlight the prioritization of internal {subject['subdivision']} sales. Confirm that independent room count adjustments are set to $0 because room and bath utility variances are absorbed within the ${reg_params['gla_rate']}/SF marginal GLA rate, preventing double-dipping.</p>
+
+CRITICAL RULES:
+1. NEVER invent property addresses (like Hillstone Dr sales). Reference ONLY the comparables listed above.
+2. NEVER say all properties have the same GLA. State their actual square footages from the list.
+3. Output ONLY the two <p> paragraphs. No markdown asterisks, no bullet lists. Total length: 200–260 words.
 """
 
     system_msg = (
         "You are an expert North Carolina real estate appraiser writing an executive listing defense brief under N.C.G.S. § 93A-83. "
-        "Write concise, authoritative, professional prose. Use plain ASCII characters only. Never use LaTeX syntax or math delimiters."
+        "Strict adherence to facts is mandatory. Use plain ASCII keyboard characters only. Never use LaTeX syntax."
     )
 
     try:
@@ -346,13 +375,12 @@ STRICT CONSTRAINTS:
             ],
             temperature=0.2,
             max_tokens=1500,
-            presence_penalty=0.3,
-            frequency_penalty=0.3
+            presence_penalty=0.4,
+            frequency_penalty=0.4
         )
         return sanitize_for_pdf(response.choices[0].message.content)
     except Exception as e:
         return f"<p>Generation failed with model <b>{chosen_model}</b>: {str(e)}</p>"
-
 # ==============================================================================
 # AUDIT-GRADE PDF EXPORT
 # ==============================================================================
