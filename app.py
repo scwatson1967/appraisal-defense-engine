@@ -167,34 +167,21 @@ def run_regression_analysis(df, subject):
 # ==============================================================================
 # COMPARABLE SELECTION (SUBDIVISION PRIORITY + ANSI BRACKETING)
 # ==============================================================================
-def select_comparables_with_subdivision(df, subject, mode="algorithmic", manual_mls_ids=None):
+def select_comparables_with_subdivision(df, subject, reg_params, mode="algorithmic", manual_mls_ids=None):
     df_pool = df.copy()
     subj_gla = subject['gla']
     subj_subd = str(subject.get('subdivision', '')).strip().lower()
+    benchmark = reg_params['benchmark']
 
     if mode == "manual" and manual_mls_ids:
-        selected = df_pool[df_pool['MLS #'].astype(str).isin([str(x) for x in manual_mls_ids])].copy()
-        
-        has_smaller = (selected['Clean_GLA'] < (subj_gla - 100)).any()
-        has_larger = (selected['Clean_GLA'] > (subj_gla + 100)).any()
+        return df_pool[df_pool['MLS #'].astype(str).isin([str(x) for x in manual_mls_ids])].copy()
 
-        if not (has_smaller and has_larger) and len(selected) < 4:
-            rem = df_pool[~df_pool['MLS #'].isin(selected['MLS #'])].copy()
-            if not has_smaller:
-                smaller_pool = rem[rem['Clean_GLA'] < subj_gla].sort_values('Clean_GLA', ascending=False)
-                if not smaller_pool.empty:
-                    selected = pd.concat([selected, smaller_pool.head(1)])
-            elif not has_larger:
-                larger_pool = rem[rem['Clean_GLA'] > subj_gla].sort_values('Clean_GLA', ascending=True)
-                if not larger_pool.empty:
-                    selected = pd.concat([selected, larger_pool.head(1)])
-        return selected
-
+    # Score comps based on GLA proximity, recency, and subdivision priority
     scores = []
     for _, row in df_pool.iterrows():
         gla_diff = abs(row['Clean_GLA'] - subj_gla)
         row_subd = str(row['Clean_Subdivision']).strip().lower()
-        subd_bonus = -500.0 if (subj_subd and subj_subd in row_subd) else 0.0
+        subd_bonus = -400.0 if (subj_subd and subj_subd in row_subd) else 0.0
         days_diff = (pd.to_datetime('today') - row['Clean_Date']).days if pd.notnull(row['Clean_Date']) else 90
         recency_penalty = min(days_diff * 0.1, 50.0)
         score = gla_diff + subd_bonus + recency_penalty
@@ -203,18 +190,36 @@ def select_comparables_with_subdivision(df, subject, mode="algorithmic", manual_
     df_pool['score'] = scores
     df_pool = df_pool.sort_values('score')
 
-    selected_comps = []
+    selected_mls = []
+
+    # 1. Prioritize closest internal subdivision sales
     subd_matches = df_pool[df_pool['Clean_Subdivision'].str.lower().str.contains(subj_subd, na=False)] if subj_subd else pd.DataFrame()
-    if not subd_matches.empty:
-        selected_comps.append(subd_matches.iloc[0]['MLS #'])
+    for _, r in subd_matches.head(2).iterrows():
+        selected_mls.append(r['MLS #'])
 
-    candidates = df_pool[~df_pool['MLS #'].isin(selected_comps)].copy()
-    for _, row in candidates.iterrows():
-        selected_comps.append(row['MLS #'])
-        if len(selected_comps) >= 4:
+    # 2. ENFORCE TWO-SIDED UNADJUSTED SALE PRICE BRACKETING
+    # Ensure at least one comp sold at or below the benchmark
+    pool_lower_price = df_pool[df_pool['Clean_Price'] <= benchmark]
+    if not pool_lower_price.empty:
+        lower_comp = pool_lower_price[~pool_lower_price['MLS #'].isin(selected_mls)].head(1)
+        if not lower_comp.empty:
+            selected_mls.append(lower_comp.iloc[0]['MLS #'])
+
+    # Ensure at least one comp sold at or above the benchmark
+    pool_upper_price = df_pool[df_pool['Clean_Price'] >= benchmark]
+    if not pool_upper_price.empty:
+        upper_comp = pool_upper_price[~pool_upper_price['MLS #'].isin(selected_mls)].head(1)
+        if not upper_comp.empty:
+            selected_mls.append(upper_comp.iloc[0]['MLS #'])
+
+    # 3. Fill remaining slots up to 4 total comparables based on overall suitability score
+    remaining = df_pool[~df_pool['MLS #'].isin(selected_mls)]
+    for _, r in remaining.iterrows():
+        if len(selected_mls) >= 4:
             break
+        selected_mls.append(r['MLS #'])
 
-    return df_pool[df_pool['MLS #'].isin(selected_comps)].copy()
+    return df_pool[df_pool['MLS #'].isin(selected_mls)].copy()
 
 # ==============================================================================
 # SALES COMPARISON GRID ADJUSTMENTS
