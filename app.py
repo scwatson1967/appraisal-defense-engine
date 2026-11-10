@@ -280,12 +280,33 @@ def calculate_grid_adjustments(comps_df, subject, reg_params):
 # ==============================================================================
 # GROQ NARRATIVE GENERATOR
 # ==============================================================================
+from groq import Groq
+
 def generate_narrative_groq(api_key, subject, reg_params, grid_df):
     clean_key = str(api_key).strip().strip('"').strip("'")
     if not clean_key or not clean_key.startswith("gsk_"):
         return "<p>Narrative generation bypassed: Missing or invalid Groq API key in Section 4.</p>"
 
     client = Groq(api_key=clean_key)
+
+    # 1. Ask Groq for the EXACT models permitted for this key
+    try:
+        models_data = client.models.list().data
+        active_ids = [m.id for m in models_data]
+    except Exception as e:
+        return f"<p>Could not fetch model list from Groq: {str(e)}</p>"
+
+    # 2. Filter out non-chat tools (guard, whisper, embed)
+    chat_candidates = [
+        m_id for m_id in active_ids 
+        if not any(blocked in m_id.lower() for blocked in ["guard", "whisper", "vision", "embed", "orpheus"])
+    ]
+
+    if not chat_candidates:
+        return f"<p>No standard text chat models found. Full model list on your key: {active_ids}</p>"
+
+    # Pick the first approved text model from your account
+    chosen_model = chat_candidates[0]
 
     min_ind = int(grid_df['indicated'].min())
     max_ind = int(grid_df['indicated'].max())
@@ -325,7 +346,7 @@ Do not repeat section titles, do not repeat sentences, and keep total length bet
 
     try:
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=chosen_model,
             messages=[
                 {"role": "system", "content": system_msg},
                 {"role": "user", "content": prompt}
@@ -337,7 +358,7 @@ Do not repeat section titles, do not repeat sentences, and keep total length bet
         )
         return sanitize_for_pdf(response.choices[0].message.content)
     except Exception as e:
-        return f"<p>Direct call to llama-3.3-70b-versatile failed: {str(e)}</p>"
+        return f"<p>Attempted model <b>{chosen_model}</b>. Error: {str(e)}<br/>Available models on this key: {active_ids}</p>"
 
 # ==============================================================================
 # AUDIT-GRADE PDF EXPORT
