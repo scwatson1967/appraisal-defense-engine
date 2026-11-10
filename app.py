@@ -286,7 +286,7 @@ from groq import Groq
 def generate_narrative_groq(api_key, subject, reg_params, grid_df):
     clean_key = str(api_key).strip().strip('"').strip("'")
     if not clean_key or not clean_key.startswith("gsk_"):
-        return "Narrative generation bypassed: Missing or invalid Groq API key."
+        return "<p>Narrative generation bypassed: Missing or invalid Groq API key.</p>"
 
     client = Groq(api_key=clean_key)
 
@@ -295,7 +295,7 @@ def generate_narrative_groq(api_key, subject, reg_params, grid_df):
     midpoint = int((min_ind + max_ind) / 2)
 
     prompt = f"""
-Subject Property: {subject['address']}, Raleigh, NC (Subdivision: {subject['subdivision']}, GLA: {subject['gla']} SF, Beds: {subject['beds']}, Baths: {subject['baths_full']}.{subject['baths_half']}, Built: {subject['year_built']}).
+Subject Property: {subject['address']}, Raleigh, NC (Subdivision: {subject['subdivision']}, GLA: {subject['gla']} SF, Beds: {subject['beds']}, Baths: {subject['baths_full']}.{subject['baths_half']}, Garage: {subject['garage_bays']} bays, Built: {subject['year_built']}).
 Statistical Benchmark: ${reg_params['benchmark']:,.0f}
 Extracted Marginal GLA Rate: ${reg_params['gla_rate']}/SF with ANSI +/- 100 SF deadband.
 Reconciled Price Corridor: ${min_ind:,.0f} to ${max_ind:,.0f} (Midpoint: ${midpoint:,.0f}).
@@ -303,47 +303,34 @@ Reconciled Price Corridor: ${min_ind:,.0f} to ${max_ind:,.0f} (Midpoint: ${midpo
 Selected Comparables Grid:
 {grid_df[['address', 'subdivision', 'price', 'gla', 'net_pct', 'gross_pct', 'indicated']].to_string()}
 
-Draft two formal appraisal defense sections:
-1. Executive Pricing Strategy & Valuation Thesis: Reconcile the corridor, midpoint, statistical benchmark, and the ANSI +/- 100 SF deadband. Explain the trade-offs between pricing at the midpoint vs. pushing the upper bound.
+Draft two professional appraisal narrative sections formatted in clean, standard HTML (use <p>, <b>, <ul>, and <li> tags; DO NOT use markdown asterisks ** or *):
+1. Executive Pricing Strategy & Valuation Thesis: Reconcile the corridor, midpoint, statistical benchmark, and the ANSI +/- 100 SF deadband. Discuss midpoint pricing vs. pushing the upper corridor limit.
 2. ANSI Z765 & Comp Bracketing Defense: Explain how the selected comparables establish Fannie Mae / ANSI two-sided bracketing across GLA, price, and location.
+Keep the analysis thorough, authoritative, and concise (under 450 words total) so it fits seamlessly on the report page without truncating.
 """
 
     system_msg = (
-        "You are a master real estate appraiser writing an appraisal review brief under N.C.G.S. § 93A-83. "
+        "You are an expert real estate appraiser writing an appraisal review brief under N.C.G.S. § 93A-83. "
         "CRITICAL FORMATTING RULES: "
-        "1. Never use LaTeX syntax or math delimiters ($...$ or $$...$$). "
+        "1. Never use LaTeX syntax or math delimiters ($...$). "
         "2. Never use the ± symbol; write '+/-'. "
-        "3. Do not use en-dashes, em-dashes, or Greek letters. "
+        "3. Output clean HTML paragraphs (<p>...</p>) and bullet lists (<ul><li>...</li></ul>) instead of markdown asterisks. "
         "4. Use plain standard ASCII keyboard characters only."
     )
 
-    # 1. Fetch available models for this specific API key
     try:
         available_models = [m.id for m in client.models.list().data]
     except Exception:
         available_models = []
 
-    # 2. Select the best match from available models
     target_model = None
-    priority_order = [
-        "llama-3.3-70b-versatile",
-        "llama-3.1-70b-versatile",
-        "llama3-70b-8192",
-        "llama-3.1-8b-instant",
-        "llama3-8b-8192",
-        "gemma2-9b-it",
-        "mixtral-8x7b-32768"
-    ]
-    for p in priority_order:
+    for p in ["llama-3.3-70b-versatile", "llama-3.1-70b-versatile", "llama3-70b-8192", "llama3-8b-8192"]:
         if p in available_models:
             target_model = p
             break
-
-    # If none of the preferred models match, use the first text model in the account
     if not target_model:
         target_model = available_models[0] if available_models else "llama-3.3-70b-versatile"
 
-    # 3. Generate completion
     try:
         response = client.chat.completions.create(
             model=target_model,
@@ -352,11 +339,11 @@ Draft two formal appraisal defense sections:
                 {"role": "user", "content": prompt}
             ],
             temperature=0.2,
-            max_tokens=1200
+            max_tokens=2500
         )
         return sanitize_for_pdf(response.choices[0].message.content)
     except Exception as e:
-        return f"Algorithmic narrative generation completed based on verified market extractions and ANSI bracketing standards. (Details: {str(e)})"
+        return f"<p>Algorithmic narrative generation completed based on verified market extractions and ANSI bracketing standards. (Details: {str(e)})</p>"
 
 
 # ==============================================================================
