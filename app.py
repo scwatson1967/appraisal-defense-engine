@@ -43,35 +43,20 @@ NC_COUNTY_CONFIG = {
 }
 
 # ==============================================================================
-# TEXT SANITIZER (PREVENTS BLACK GLYPH BOXES IN REPORTLAB / HELVETICA)
+# TEXT SANITIZER
 # ==============================================================================
 def sanitize_for_pdf(text: str) -> str:
     if not isinstance(text, str):
         return str(text)
 
     replacements = {
-        r"\pm": "+/-",
-        "±": "+/-",
-        r"\approx": "~",
-        "≈": "~",
-        r"\times": "x",
-        "×": "x",
-        r"\le": "<=",
-        r"\ge": ">=",
-        "–": "-",
-        "—": "-",
-        "“": '"',
-        "”": '"',
-        "’": "'",
-        "‘": "'",
-        "…": "...",
-        "•": "|",
-        "\u00a0": " ",
-        "\u200b": "",
+        r"\pm": "+/-", "±": "+/-", r"\approx": "~", "≈": "~",
+        r"\times": "x", "×": "x", r"\le": "<=", r"\ge": ">=",
+        "–": "-", "—": "-", "“": '"', "”": '"', "’": "'", "‘": "'",
+        "…": "...", "•": "|", "\u00a0": " ", "\u200b": "",
     }
     for old, new in replacements.items():
         text = text.replace(old, new)
-
     text = re.sub(r'\$(.*?)\$', r'\1', text)
     text = text.replace(r"\mathbb{H}", "").replace(r"\mathbb", "").replace(r"\Pi", "").replace(r"\s", "")
     text = re.sub(r'[^\x00-\x7F]+', ' ', text)
@@ -88,6 +73,12 @@ def clean_currency(val) -> float:
     val_str = re.sub(r'[^\d.]', '', str(val))
     return float(val_str) if val_str else 0.0
 
+def map_prop_type(val) -> str:
+    v = str(val).lower()
+    if 'condo' in v: return 'Condo'
+    if 'town' in v or 'attached' in v or 'duplex' in v: return 'Attached'
+    return 'Detached'
+
 def load_and_clean_csv(file) -> pd.DataFrame:
     df = pd.read_csv(file)
 
@@ -96,10 +87,9 @@ def load_and_clean_csv(file) -> pd.DataFrame:
     else:
         df['MLS #'] = [f"MLS-{i+1}" for i in range(len(df))]
 
-    if 'Address' not in df.columns:
-        addr_cols = ['Street Address', 'Full Address', 'Property Address']
-        found_addr = next((c for c in addr_cols if c in df.columns), None)
-        df['Address'] = df[found_addr].astype(str) if found_addr else "Unknown Address"
+    addr_cols = ['Street Address', 'Full Address', 'Property Address', 'Address']
+    found_addr = next((c for c in addr_cols if c in df.columns), None)
+    df['Address'] = df[found_addr].astype(str) if found_addr else "Unknown Address"
 
     price_cols = ['Close Price', 'Sold Price', 'Purchase Price', 'Price']
     found_price = next((c for c in price_cols if c in df.columns), None)
@@ -113,6 +103,10 @@ def load_and_clean_csv(file) -> pd.DataFrame:
     bsmt_cols = ['Below Grade Finished Area', 'Basement Finished SqFt', 'Finished Basement']
     found_bsmt = next((c for c in bsmt_cols if c in df.columns), None)
     df['Clean_Bsmt_Fin'] = df[found_bsmt].apply(clean_currency) if found_bsmt else 0.0
+
+    type_cols = ['Property Sub Type', 'Property Type', 'Type', 'Sub Type']
+    found_type = next((c for c in type_cols if c in df.columns), None)
+    df['Clean_Property_Type'] = df[found_type].apply(map_prop_type) if found_type else 'Detached'
 
     yr_cols = ['Year Built', 'Yr Built', 'Built']
     found_yr = next((c for c in yr_cols if c in df.columns), None)
@@ -148,12 +142,6 @@ def load_and_clean_csv(file) -> pd.DataFrame:
     return df
 
 def fetch_comps_from_nconemap(address: str, radius_miles: float) -> tuple[dict, pd.DataFrame]:
-    """
-    Free, keyless public records lookup:
-    - Uses ArcGIS Geocoder for exact coordinates & county detection.
-    - Tries Wake County's ArcGIS Online Parcels FeatureServer for Wake County, with automatic
-      fallback to NC OneMap Statewide Parcels REST API for all 8 counties.
-    """
     geo_url = "https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates"
     geo_params = {
         "SingleLine": address.strip(),
@@ -183,6 +171,7 @@ def fetch_comps_from_nconemap(address: str, radius_miles: float) -> tuple[dict, 
         "address": attrs.get("Match_addr") or address.strip(),
         "county": detected_county,
         "subdivision": "",
+        "property_type": "Detached",
         "year_built": 2000,
         "gla": 0,
         "beds": 3,
@@ -203,7 +192,7 @@ def fetch_comps_from_nconemap(address: str, radius_miles: float) -> tuple[dict, 
                 "inSR": "4326",
                 "spatialRel": "esriSpatialRelIntersects",
                 "where": "HEATEDAREA > 500",
-                "outFields": "PIN_NUM,SITE_ADDRESS,HEATEDAREA,YEAR_BUILT,TOTSALPRICE,TOTAL_VALUE_ASSD,SALE_DATE,MAP_NAME",
+                "outFields": "PIN_NUM,SITE_ADDRESS,HEATEDAREA,YEAR_BUILT,TOTSALPRICE,TOTAL_VALUE_ASSD,SALE_DATE,MAP_NAME,TYPE_USE_DECODE",
                 "returnGeometry": "false",
                 "resultRecordCount": 150,
                 "f": "json"
@@ -216,6 +205,7 @@ def fetch_comps_from_nconemap(address: str, radius_miles: float) -> tuple[dict, 
                     heated = float(a.get("HEATEDAREA") or 0)
                     yr_built = int(a.get("YEAR_BUILT") or 2000)
                     subd = str(a.get("MAP_NAME") or "").strip()
+                    ptype = map_prop_type(a.get("TYPE_USE_DECODE", ""))
 
                     sale_price = float(a.get("TOTSALPRICE") or 0)
                     if sale_price <= 35000:
@@ -233,6 +223,7 @@ def fetch_comps_from_nconemap(address: str, radius_miles: float) -> tuple[dict, 
 
                     if site_addr.lower().startswith(street_num + " "):
                         subject_autofill["gla"] = int(heated)
+                        subject_autofill["property_type"] = ptype
                         if 1800 < yr_built <= 2027:
                             subject_autofill["year_built"] = yr_built
                         if subd:
@@ -252,11 +243,12 @@ def fetch_comps_from_nconemap(address: str, radius_miles: float) -> tuple[dict, 
                         "Clean_Subdivision": subd,
                         "Clean_Date": clean_dt,
                         "Clean_Garage": 2.0,
+                        "Clean_Property_Type": ptype,
                     })
         except Exception:
             pass
 
-    # 2. NC ONEMAP STATEWIDE PARCELS (Covers all 8 counties & acts as automatic fallback)
+    # 2. NC ONEMAP STATEWIDE PARCELS FALLBACK
     if not rows:
         parcel_url = "https://services.nconemap.gov/secure/rest/services/NC1Map_Parcels/MapServer/0/query"
         p_params = {
@@ -265,7 +257,7 @@ def fetch_comps_from_nconemap(address: str, radius_miles: float) -> tuple[dict, 
             "inSR": "4326",
             "spatialRel": "esriSpatialRelIntersects",
             "where": "parval > 40000 AND improvval > 20000",
-            "outFields": "parno,siteadd,scity,parval,improvval,landval,saledate,gisacres,cntyname",
+            "outFields": "parno,siteadd,scity,parval,improvval,landval,saledate,gisacres,cntyname,parusedesc",
             "returnGeometry": "false",
             "resultRecordCount": 150,
             "f": "json"
@@ -283,6 +275,7 @@ def fetch_comps_from_nconemap(address: str, radius_miles: float) -> tuple[dict, 
 
             site_addr = str(a.get("siteadd") or a.get("SITEADD") or f"Parcel {a.get('parno', idx+1)}").strip()
             est_gla = round(max(imp_val / 165.0, 900.0), -1)
+            ptype = map_prop_type(a.get("parusedesc", ""))
 
             raw_dt = a.get("saledate") or a.get("SALEDATE")
             if isinstance(raw_dt, (int, float)) and raw_dt > 0:
@@ -295,6 +288,7 @@ def fetch_comps_from_nconemap(address: str, radius_miles: float) -> tuple[dict, 
             if site_addr.lower().startswith(street_num + " "):
                 if subject_autofill["gla"] == 0:
                     subject_autofill["gla"] = int(est_gla)
+                subject_autofill["property_type"] = ptype
                 continue
 
             rows.append({
@@ -310,6 +304,7 @@ def fetch_comps_from_nconemap(address: str, radius_miles: float) -> tuple[dict, 
                 "Clean_Subdivision": "",
                 "Clean_Date": clean_dt,
                 "Clean_Garage": 2.0,
+                "Clean_Property_Type": ptype,
             })
 
     return subject_autofill, pd.DataFrame(rows)
@@ -317,84 +312,61 @@ def fetch_comps_from_nconemap(address: str, radius_miles: float) -> tuple[dict, 
 # ==============================================================================
 # EMPIRICAL MARKET CONDITIONS (TIME TREND) EXTRACTOR
 # ==============================================================================
-def calculate_historical_market_trend(df: pd.DataFrame, val_date_str: str) -> dict:
-    """
-    Analyzes historical sales dates and Price/SF in the dataset to empirically extract
-    the monthly market appreciation/depreciation trend (% per month) via OLS regression.
-    """
-    val_dt = pd.to_datetime(val_date_str)
-    trend_df = df[(df['Clean_GLA'] > 500) & (df['Clean_Price'] > 20000) & (df['Clean_Date'].notnull())].copy()
+def calculate_historical_market_trend(df: pd.DataFrame, subject: dict) -> dict:
+    val_dt = pd.to_datetime(subject['val_date'])
+    # Strictly isolate trend to the SAME property type
+    trend_df = df[(df['Clean_GLA'] > 500) & (df['Clean_Price'] > 20000) & (df['Clean_Date'].notnull()) & (df['Clean_Property_Type'] == subject['property_type'])].copy()
 
-    # Focus on transactions within the last 18 months so legacy decades-old deeds don't distort current trend
     trend_df['Months_Ago'] = (val_dt - trend_df['Clean_Date']).dt.days / 30.4375
     recent_df = trend_df[(trend_df['Months_Ago'] >= 0) & (trend_df['Months_Ago'] <= 18)].copy()
 
     if len(recent_df) < 5:
         return {
-            "monthly_pct": 0.0,
-            "annual_pct": 0.0,
-            "sample_size": len(recent_df),
-            "span_days": 0,
-            "status": "Insufficient recent sales (<5) for time regression; defaulted to 0.00%/mo."
+            "monthly_pct": 0.0, "annual_pct": 0.0, "sample_size": len(recent_df),
+            "span_days": 0, "status": f"Insufficient {subject['property_type']} sales (<5) for trend; default 0.00%/mo."
         }
 
     span_days = int((recent_df['Clean_Date'].max() - recent_df['Clean_Date'].min()).days)
     if span_days < 45:
         return {
-            "monthly_pct": 0.0,
-            "annual_pct": 0.0,
-            "sample_size": len(recent_df),
-            "span_days": span_days,
-            "status": f"Date span too narrow ({span_days} days); defaulted to 0.00%/mo."
+            "monthly_pct": 0.0, "annual_pct": 0.0, "sample_size": len(recent_df),
+            "span_days": span_days, "status": f"Date span too narrow ({span_days} days); default 0.00%/mo."
         }
 
     recent_df['PPSF'] = recent_df['Clean_Price'] / recent_df['Clean_GLA']
-    # Trim extreme 5% tails to prevent tear-downs or luxury outliers from skewing the slope
     q_low, q_high = recent_df['PPSF'].quantile([0.05, 0.95])
     trimmed = recent_df[(recent_df['PPSF'] >= q_low) & (recent_df['PPSF'] <= q_high)].copy()
     if len(trimmed) < 5:
         trimmed = recent_df
 
     try:
-        # Regress PPSF on Months_Ago: a negative slope on Months_Ago means older sales sold for LESS (appreciating market);
-        # a positive slope on Months_Ago means older sales sold for MORE (declining market).
         X = sm.add_constant(trimmed['Months_Ago'], has_constant='add')
         y = trimmed['PPSF']
         model = sm.OLS(y, X).fit()
         slope_per_month_ago = float(model.params.get('Months_Ago', 0.0))
         median_ppsf = float(trimmed['PPSF'].median())
 
-        if median_ppsf > 0:
-            raw_monthly_pct = (-slope_per_month_ago / median_ppsf) * 100.0
-        else:
-            raw_monthly_pct = 0.0
-
-        # Clamp within realistic residential bounds (-0.75%/mo to +0.75%/mo)
+        raw_monthly_pct = (-slope_per_month_ago / median_ppsf) * 100.0 if median_ppsf > 0 else 0.0
         monthly_pct = round(float(np.clip(raw_monthly_pct, -0.75, 0.75)), 2)
         annual_pct = round(monthly_pct * 12.0, 1)
         direction = "declining" if monthly_pct < -0.04 else ("appreciating" if monthly_pct > 0.04 else "stable")
 
         return {
-            "monthly_pct": monthly_pct,
-            "annual_pct": annual_pct,
-            "sample_size": len(trimmed),
+            "monthly_pct": monthly_pct, "annual_pct": annual_pct, "sample_size": len(trimmed),
             "span_days": span_days,
-            "status": f"Data-driven ({len(trimmed)} sales over {span_days} days): {direction} at {monthly_pct:+.2f}%/mo ({annual_pct:+.1f}%/yr)."
+            "status": f"{subject['property_type']} trend ({len(trimmed)} sales): {direction} at {monthly_pct:+.2f}%/mo."
         }
     except Exception:
         return {
-            "monthly_pct": 0.0,
-            "annual_pct": 0.0,
-            "sample_size": len(recent_df),
-            "span_days": span_days,
-            "status": "Trend regression fallback: 0.00%/mo."
+            "monthly_pct": 0.0, "annual_pct": 0.0, "sample_size": len(recent_df),
+            "span_days": span_days, "status": "Trend regression fallback: 0.00%/mo."
         }
 
 # ==============================================================================
 # HEDONIC REGRESSION & SENSITIVITY ENGINE
 # ==============================================================================
 def run_regression_analysis(df: pd.DataFrame, subject: dict) -> dict:
-    reg_df = df[df['Clean_GLA'] > 500].copy()
+    reg_df = df[(df['Clean_GLA'] > 500) & (df['Clean_Property_Type'] == subject['property_type'])].copy()
     if len(reg_df) < 5:
         median_ppsf = (reg_df['Clean_Price'] / reg_df['Clean_GLA']).median() if not reg_df.empty else 185.0
         return {
@@ -442,16 +414,28 @@ def run_regression_analysis(df: pd.DataFrame, subject: dict) -> dict:
     }
 
 # ==============================================================================
-# COMPARABLE SELECTION (EXACT SUBDIVISION PRIORITY + TWO-SIDED BRACKETING)
+# COMPARABLE SELECTION (HARD 12-MONTH LIMIT & 6-MONTH PREFERENCE)
 # ==============================================================================
 def select_comparables_with_subdivision(df: pd.DataFrame, subject: dict, reg_params: dict, mode: str = "algorithmic", manual_mls_ids=None) -> pd.DataFrame:
     df_pool = df.copy()
-    subj_gla = subject['gla']
-    subj_subd = str(subject.get('subdivision', '')).strip().lower()
-    benchmark = reg_params['benchmark']
+    val_dt = pd.to_datetime(subject['val_date'])
+    
+    # 1. STRICT PROPERTY TYPE MATCH
+    df_pool = df_pool[df_pool['Clean_Property_Type'] == subject['property_type']].copy()
+    
+    # 2. STRICT 12-MONTH HARD STOP (<= 365 Days)
+    df_pool['days_old'] = (val_dt - df_pool['Clean_Date']).dt.days
+    df_pool = df_pool[(df_pool['days_old'] >= 0) & (df_pool['days_old'] <= 365)].copy()
+
+    if df_pool.empty:
+        return df_pool
 
     if mode == "manual" and manual_mls_ids:
         return df_pool[df_pool['MLS #'].astype(str).isin([str(x) for x in manual_mls_ids])].copy()
+
+    subj_gla = subject['gla']
+    subj_subd = str(subject.get('subdivision', '')).strip().lower()
+    benchmark = reg_params['benchmark']
 
     scores = []
     for _, row in df_pool.iterrows():
@@ -465,8 +449,13 @@ def select_comparables_with_subdivision(df: pd.DataFrame, subject: dict, reg_par
         else:
             subd_bonus = 0.0
 
-        days_diff = (pd.to_datetime(subject['val_date']) - row['Clean_Date']).days if pd.notnull(row['Clean_Date']) else 90
-        recency_penalty = min(max(days_diff, 0) * 0.15, 60.0)
+        # 3. 6-MONTH PREFERENCE SCORING (Steeper penalty for > 180 days)
+        days_diff = row['days_old']
+        if days_diff <= 180:
+            recency_penalty = days_diff * 0.05
+        else:
+            recency_penalty = (180 * 0.05) + ((days_diff - 180) * 0.25)
+            
         score = gla_diff + subd_bonus + recency_penalty
         scores.append(score)
 
@@ -474,7 +463,6 @@ def select_comparables_with_subdivision(df: pd.DataFrame, subject: dict, reg_par
     df_pool = df_pool.sort_values('score')
 
     selected_mls = []
-
     if subj_subd:
         subd_matches = df_pool[df_pool['Clean_Subdivision'].str.lower().str.strip() == subj_subd]
         for _, r in subd_matches.head(2).iterrows():
@@ -525,18 +513,15 @@ def calculate_grid_adjustments(comps_df: pd.DataFrame, subject: dict, reg_params
         price = row['Clean_Price']
         comp_gla = row['Clean_GLA']
 
-        # 1. Data-Driven Market Conditions (Time) Adjustment
         if pd.notnull(row['Clean_Date']) and monthly_trend != 0.0:
             months_elapsed = max((val_dt - row['Clean_Date']).days / 30.4375, 0.0)
             time_adj = round(price * monthly_trend * months_elapsed, 0)
         else:
             time_adj = 0.0
 
-        # 2. ANSI Z765 Living Area Deadband (+/- 100 SF receives $0)
         gla_diff = subject['gla'] - comp_gla
         gla_adj = 0.0 if abs(gla_diff) <= deadband else round(gla_diff * gla_rate, 0)
 
-        # 3. Dynamic Room / Bath Contributory Utility Analysis
         fb_diff = subject['baths_full'] - row['Clean_FB']
         hb_diff = subject['baths_half'] - row['Clean_HB']
         raw_fb_rate = reg_params.get('fb_adj', 7500.0)
@@ -544,24 +529,21 @@ def calculate_grid_adjustments(comps_df: pd.DataFrame, subject: dict, reg_params
 
         if (fb_diff <= 0 and hb_diff >= 0) or (fb_diff < 0):
             room_adj = 0.0
-            room_logic_note = "GLA adjustment absorbed functional room utility; no inverted bath premium."
+            room_logic_note = "GLA adjustment absorbed functional utility."
         elif fb_diff > 0:
             room_adj = round((fb_diff * raw_fb_rate) + (hb_diff * raw_hb_rate), 0)
-            room_logic_note = f"Comp inferior by {fb_diff} full bath(s); adjusted upward."
+            room_logic_note = f"Comp inferior by {fb_diff} bath(s); adjusted up."
         else:
             room_adj = 0.0
-            room_logic_note = "Equivalent functional bath utility."
+            room_logic_note = "Equivalent functional utility."
 
-        # 4. Garage Adjustments ($10,000 per bay)
         gar_diff = subject['garage_bays'] - row['Clean_Garage']
         gar_adj = round(gar_diff * 10000.0, 0)
 
-        # 5. Below-Grade Finished Basement Net Difference ($50/SF)
         comp_bsmt = row.get('Clean_Bsmt_Fin', 0.0)
         bsmt_diff = subject['bsmt_fin'] - comp_bsmt
         bsmt_adj = round(bsmt_diff * 50.0, 0)
 
-        # 6. Age / Condition / Amenities Combined Physical Feature Adjustment
         yr_diff = subject['year_built'] - row.get('Clean_Year', subject['year_built'])
         age_adj = round(np.clip(yr_diff * 350.0, -12000.0, 12000.0), 0) if abs(yr_diff) >= 5 else 0.0
         other_adj = round(cond_adj_val + amenity_adj_val + age_adj, 0)
@@ -598,7 +580,7 @@ def calculate_grid_adjustments(comps_df: pd.DataFrame, subject: dict, reg_params
     return pd.DataFrame(grid_rows)
 
 # ==============================================================================
-# GROQ NARRATIVE GENERATOR (USPAP AO-18 COMPLIANT MARKET BRIEF)
+# GROQ NARRATIVE GENERATOR
 # ==============================================================================
 def generate_narrative_groq(api_key: str, subject: dict, reg_params: dict, grid_df: pd.DataFrame, trend_info: dict) -> str:
     min_ind = int(grid_df['indicated'].min())
@@ -621,17 +603,17 @@ def generate_narrative_groq(api_key: str, subject: dict, reg_params: dict, grid_
             f"For executed contract review on {subject['address']} in {subd_label}, the sales comparison grid establishes "
             f"an adjusted value range of ${min_ind:,.0f} to ${max_ind:,.0f} (midpoint ${midpoint:,.0f}) against a statistical "
             f"hedonic benchmark of ${benchmark:,.0f}, reflecting an empirically derived market trend of {trend_info['monthly_pct']:+.2f}%/month "
-            f"({trend_info['annual_pct']:+.1f}%/year) across {trend_info['sample_size']} historical transactions. Contracts ratified near or below "
-            f"the corridor midpoint are well-supported by closed neighborhood comparables, whereas contract prices approaching ${max_ind:,.0f} "
+            f"({trend_info['annual_pct']:+.1f}%/year) across {trend_info['sample_size']} historical {subject['property_type']} transactions. Contracts ratified near or below "
+            f"the corridor midpoint are well-supported by closed neighborhood comparables (all settling within the prior 12 months), whereas contract prices approaching ${max_ind:,.0f} "
             f"require strong documentary support for condition, upgrades, and net seller concessions."
         )
     else:
         thesis_sentence = (
             f"The pre-listing market analysis for {subject['address']} in {subd_label} establishes an indicated price range "
             f"of ${min_ind:,.0f} to ${max_ind:,.0f}, yielding a supported corridor midpoint of ${midpoint:,.0f} against a statistical "
-            f"hedonic benchmark of ${benchmark:,.0f}. Historical sales regression across {trend_info['sample_size']} transactions indicates a "
+            f"hedonic benchmark of ${benchmark:,.0f}. Historical sales regression across {trend_info['sample_size']} {subject['property_type']} transactions indicates a "
             f"market velocity of {trend_info['monthly_pct']:+.2f}%/month ({trend_info['annual_pct']:+.1f}%/year). Positioning list price near the midpoint "
-            f"aligns with current {subject['county']} County buyer absorption, whereas pricing toward the upper limit (${max_ind:,.0f}) increases "
+            f"aligns with current {subject['county']} County buyer absorption based strictly on sales closed within the past 12 months, whereas pricing toward the upper limit (${max_ind:,.0f}) increases "
             f"days-on-market and lender appraisal-gap risk for a {subject['beds']}-bedroom, {subj_bath_str} residence."
         )
 
@@ -664,17 +646,12 @@ def generate_narrative_groq(api_key: str, subject: dict, reg_params: dict, grid_
         active_ids = [m.id for m in models_data]
 
         preferred_models = [
-            "openai/gpt-oss-120b",
-            "qwen/qwen3.6-27b",
-            "openai/gpt-oss-20b",
-            "llama-3.3-70b-versatile",
+            "openai/gpt-oss-120b", "qwen/qwen3.6-27b",
+            "openai/gpt-oss-20b", "llama-3.3-70b-versatile"
         ]
         chosen_model = next((m for m in preferred_models if m in active_ids), None)
         if not chosen_model:
-            chat_candidates = [
-                m for m in active_ids
-                if not any(b in m.lower() for b in ["guard", "whisper", "vision", "embed", "orpheus"])
-            ]
+            chat_candidates = [m for m in active_ids if not any(b in m.lower() for b in ["guard", "whisper", "vision", "embed", "orpheus"])]
             chosen_model = chat_candidates[0] if chat_candidates else "openai/gpt-oss-120b"
 
         comp_lines = "\n".join([
@@ -684,11 +661,11 @@ def generate_narrative_groq(api_key: str, subject: dict, reg_params: dict, grid_
 
         prompt = f"""
 DELIVERABLE MODE: {val_mode}
-SUBJECT PROPERTY: {subject['address']} ({subject['county']} County, NC | {subd_label}) | Built {subject['year_built']} | Condition: {subject['condition']} | GLA: {subject['gla']:,} SF | {subject['beds']}b/{subj_bath_str} | Bsmt Fin: {subject['bsmt_fin']:,} SF
+SUBJECT PROPERTY: {subject['address']} ({subject['county']} County, NC | {subd_label}) | Built {subject['year_built']} | Type: {subject['property_type']} | Condition: {subject['condition']} | GLA: {subject['gla']:,} SF | {subject['beds']}b/{subj_bath_str} | Bsmt Fin: {subject['bsmt_fin']:,} SF
 Hedonic Benchmark: ${benchmark:,.0f} | Indicated Range: ${min_ind:,.0f} to ${max_ind:,.0f} (Midpoint: ${midpoint:,.0f}) | Extracted GLA Rate: ${gla_rate}/SF
-Empirically Extracted Market Trend: {trend_info['monthly_pct']:+.2f}%/month ({trend_info['annual_pct']:+.1f}%/year across {trend_info['sample_size']} historical sales)
+Empirically Extracted Market Trend: {trend_info['monthly_pct']:+.2f}%/month ({trend_info['annual_pct']:+.1f}%/year across {trend_info['sample_size']} historical {subject['property_type']} sales)
 
-COMPARABLES GRID:
+COMPARABLES GRID (All < 12 Months Old):
 {comp_lines}
 
 BRACKETING REFERENCES:
@@ -697,7 +674,7 @@ BRACKETING REFERENCES:
 
 Write an executive market pricing & defense brief formatted strictly as TWO HTML paragraphs (<p><b>Title:</b> Text</p>):
 
-1. <p><b>Executive Pricing Strategy & Market Range Thesis:</b> Tailor this paragraph specifically to "{val_mode}". Reconcile the indicated range (${min_ind:,.0f}-${max_ind:,.0f}), midpoint (${midpoint:,.0f}), and hedonic benchmark (${benchmark:,.0f}), noting the data-derived {trend_info['monthly_pct']:+.2f}%/month market trend in {subject['county']} County.</p>
+1. <p><b>Executive Pricing Strategy & Market Range Thesis:</b> Tailor this paragraph specifically to "{val_mode}". Reconcile the indicated range (${min_ind:,.0f}-${max_ind:,.0f}), midpoint (${midpoint:,.0f}), and hedonic benchmark (${benchmark:,.0f}), noting the data-derived {trend_info['monthly_pct']:+.2f}%/month market trend specifically for {subject['property_type']} properties in {subject['county']} County. Explicitly state that all comparables utilized closed within the prior 12 months.</p>
 
 2. <p><b>ANSI Z765 & Functional Utility Bracketing Analysis:</b> Reference {min_gla_row['address']} ({int(min_gla_row['gla']):,} SF) and {max_gla_row['address']} ({int(max_gla_row['gla']):,} SF) bracketing the subject's {subject['gla']:,} SF. Explain how the ${gla_rate}/SF GLA adjustment captures overall living area utility without double-counting bedroom/bath differences.</p>
 
@@ -709,14 +686,10 @@ CRITICAL COMPLIANCE & ACCURACY RULES:
         response = client.chat.completions.create(
             model=chosen_model,
             messages=[
-                {
-                    "role": "system",
-                    "content": "You are a real estate market data analyst writing a statistical Comparative Market Analysis (CMA) and pricing strategy brief. Never present the output as a USPAP appraisal."
-                },
+                {"role": "system", "content": "You are a real estate market data analyst writing a statistical Comparative Market Analysis (CMA) and pricing strategy brief. Never present the output as a USPAP appraisal."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.2,
-            max_tokens=900
+            temperature=0.2, max_tokens=900
         )
         content = response.choices[0].message.content.strip()
         return sanitize_for_pdf(content) if content else fallback_narrative
@@ -795,11 +768,11 @@ def build_pdf_report(subject: dict, reg_params: dict, grid_df: pd.DataFrame, nar
     <body>
         <div class="header-bar">
             <div class="header-title">Automated Market Range & Listing Defense Brief ({subject['val_mode']})</div>
-            <div class="header-sub">Subject: {sanitize_for_pdf(subject['address'])} | County: {subject['county']} | Subdivision: {sanitize_for_pdf(subject['subdivision'] or 'Submarket')} | Date: {subject['val_date']}</div>
+            <div class="header-sub">Subject: {sanitize_for_pdf(subject['address'])} | County: {subject['county']} | Type: {subject['property_type']} | Date: {subject['val_date']}</div>
         </div>
 
         <div class="disclaimer">
-            <strong>IMPORTANT NOTICE & USPAP ADVISORY OPINION 18 DISCLOSURE:</strong> THIS IS NOT AN APPRAISAL. This report is an automated software-generated market analysis and Comparative Market Analysis (CMA) prepared for informational and transaction consultation purposes only. It has not been developed in accordance with the Uniform Standards of Professional Appraisal Practice (USPAP) and does not represent an opinion of value by a licensed or certified real estate appraiser. If you require a formal USPAP-compliant appraisal for mortgage lending, equitable distribution (divorce), estate/probate tax filing, or property tax appeal, please contact our office to engage a formal appraisal assignment.
+            <strong>IMPORTANT NOTICE & USPAP ADVISORY OPINION 18 DISCLOSURE:</strong> THIS IS NOT AN APPRAISAL. This report is an automated software-generated market analysis and Comparative Market Analysis (CMA) prepared for informational and transaction consultation purposes only. It has not been developed in accordance with the Uniform Standards of Professional Appraisal Practice (USPAP).
         </div>
 
         <table class="kpi-table">
@@ -807,7 +780,7 @@ def build_pdf_report(subject: dict, reg_params: dict, grid_df: pd.DataFrame, nar
                 <td class="kpi-box"><div class="kpi-lbl">Statistical Benchmark</div><div class="kpi-val">${reg_params['benchmark']:,.0f}</div></td>
                 <td class="kpi-box"><div class="kpi-lbl">Indicated Midpoint</div><div class="kpi-val">${midpoint:,.0f}</div></td>
                 <td class="kpi-box"><div class="kpi-lbl">Indicated Value Range</div><div class="kpi-val">${min_val:,.0f} - ${max_val:,.0f}</div></td>
-                <td class="kpi-box"><div class="kpi-lbl">Extracted Market Trend</div><div class="kpi-val">{trend_info['monthly_pct']:+.2f}% / mo</div></td>
+                <td class="kpi-box"><div class="kpi-lbl">{subject['property_type']} Mkt Trend</div><div class="kpi-val">{trend_info['monthly_pct']:+.2f}% / mo</div></td>
             </tr>
         </table>
 
@@ -816,7 +789,7 @@ def build_pdf_report(subject: dict, reg_params: dict, grid_df: pd.DataFrame, nar
             {clean_narrative}
         </div>
 
-        <div class="section-title">2. Sales Comparison Model Grid (ANSI Z765 Bracketing)</div>
+        <div class="section-title">2. Sales Comparison Model Grid (< 12 Month Limit Enforced)</div>
         <table class="comp-grid">
             <thead>
                 <tr>
@@ -838,11 +811,7 @@ def build_pdf_report(subject: dict, reg_params: dict, grid_df: pd.DataFrame, nar
             </tbody>
         </table>
         <div style="font-size: 6.5pt; color: #64748B; margin-top: 4px;">
-            *Model Parameters: Living area variances within +/- 100 SF receive $0 per ANSI Z765 standards. Extracted GLA Rate: ${reg_params['gla_rate']}/SF. Market condition trend empirically derived from historical sales ({trend_info['monthly_pct']:+.2f}%/mo, n={trend_info['sample_size']}). Garage valued at $10,000/bay; net finished basement differential at $50/SF.
-        </div>
-
-        <div class="cta-box">
-            <strong>Need a Certified Appraisal for Court, Estate, Tax Appeal, or Pre-Listing Certainty?</strong> Our firm covers Wake, Durham, Orange, Johnston, Cumberland, Franklin, Chatham, and Granville counties. Contact us to order an independent, USPAP-compliant appraisal report.
+            *Model Parameters: All comparables utilized closed within the prior 12 months. Extracted GLA Rate: ${reg_params['gla_rate']}/SF. Market condition trend empirically derived from historical sales ({trend_info['monthly_pct']:+.2f}%/mo, n={trend_info['sample_size']}). Garage valued at $10,000/bay; net finished basement differential at $50/SF.
         </div>
     </body>
     </html>
@@ -870,35 +839,20 @@ with st.sidebar:
     county_meta = NC_COUNTY_CONFIG[selected_county]
     st.caption(f"Market Profile: {county_meta['tier']} (Default Radius: {county_meta['default_radius']} mi)")
 
-    search_radius = st.slider(
-        "Comparable Search Radius (Miles):",
-        min_value=0.25,
-        max_value=5.0,
-        value=float(county_meta["default_radius"]),
-        step=0.25
-    )
+    search_radius = st.slider("Comparable Search Radius (Miles):", 0.25, 5.0, float(county_meta["default_radius"]), 0.25)
 
     st.header("2. Deliverable Strategy Mode")
     val_mode = st.radio("Brief Purpose:", ["Pre-Listing / CMA Strategy", "Executed Contract Defense"])
     val_date = st.date_input("Effective Analysis Date:", value=date.today())
 
     st.header("3. Market Conditions (Time Trend)")
-    trend_mode = st.radio(
-        "Time Adjustment Method:",
-        ["Auto-Detect from Historical Data", "Manual Override"]
-    )
+    trend_mode = st.radio("Time Adjustment Method:", ["Auto-Detect from Historical Data", "Manual Override"])
     manual_trend_override = 0.0
     if trend_mode == "Manual Override":
-        manual_trend_override = st.slider(
-            "Manual Monthly Trend (%):",
-            min_value=-0.75,
-            max_value=0.75,
-            value=0.0,
-            step=0.05
-        )
+        manual_trend_override = st.slider("Manual Monthly Trend (%):", -0.75, 0.75, 0.0, 0.05)
 
     st.header("4. Comparable Selection Mode")
-    comp_mode = st.radio("Selection Strategy:", ["Algorithmic (Two-Sided Bracketing)", "Manual Override (Pick Specific Comps)"])
+    comp_mode = st.radio("Selection Strategy:", ["Algorithmic (12-Mo Limit)", "Manual Override (Pick Specific Comps)"])
 
     st.header("5. Narrative Engine")
     groq_api_key = os.getenv("GROQ_API_KEY", st.secrets.get("GROQ_API_KEY", ""))
@@ -908,10 +862,10 @@ with st.sidebar:
         st.info("Running Deterministic Narrative Mode")
 
 # ==============================================================================
-# MAIN INTERFACE: 3-TAB MULTI-COUNTY INTAKE (NO PREDETERMINED SUBJECT DATA)
+# MAIN INTERFACE: 3-TAB MULTI-COUNTY INTAKE
 # ==============================================================================
 st.markdown('<div class="report-header">8-County NC Valuation & Listing Defense Engine</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Wake • Durham • Orange • Johnston • Cumberland • Franklin • Chatham • Granville</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Strict Property Type Segmentation • 12-Month Limits • Historical Trend Extraction</div>', unsafe_allow_html=True)
 
 tab_addr, tab_csv, tab_manual = st.tabs([
     "1. Address Lookup (Free Public Records)",
@@ -920,12 +874,8 @@ tab_addr, tab_csv, tab_manual = st.tabs([
 ])
 
 with tab_addr:
-    st.markdown("Enter a residential street address in Wake, Durham, Orange, Johnston, Cumberland, Franklin, Chatham, or Granville County to pull public parcel and sales records.")
-    lookup_addr = st.text_input(
-        "Property Street Address, City, State, ZIP:",
-        value="",
-        placeholder="e.g., 123 Main St, Raleigh, NC 27601"
-    )
+    st.markdown("Enter a residential street address to pull public parcel and sales records.")
+    lookup_addr = st.text_input("Property Street Address, City, State, ZIP:", value="", placeholder="e.g., 123 Main St, Raleigh, NC 27601")
 
     if st.button("Fetch Public Parcel & Comparable Data"):
         if not lookup_addr.strip():
@@ -935,11 +885,11 @@ with tab_addr:
                 try:
                     subj_auto, api_df = fetch_comps_from_nconemap(lookup_addr, search_radius)
                     if api_df.empty:
-                        st.error("No parcel sales records returned within that radius. Try increasing the Search Radius in the sidebar or use Tab 2 / Tab 3.")
+                        st.error("No parcel sales records returned. Try increasing the Search Radius.")
                     else:
                         st.session_state["autofill_subject"] = subj_auto
                         st.session_state["active_comps_df"] = api_df
-                        st.success(f"Found {len(api_df)} nearby parcel records in {subj_auto['county']} County. Verify subject specs below and click Generate.")
+                        st.success(f"Found {len(api_df)} records. Verify subject specs below.")
                 except Exception as e:
                     st.error(f"Public records lookup failed: {e}")
 
@@ -952,9 +902,9 @@ with tab_csv:
         st.success(f"Loaded {len(csv_df)} market records from MLS CSV.")
 
 with tab_manual:
-    st.markdown("Enter or paste 3 to 6 recent neighborhood sales directly if public records are sparse.")
+    st.markdown("Enter or paste recent neighborhood sales directly.")
     empty_manual = pd.DataFrame(columns=[
-        "MLS #", "Address", "Clean_Price", "Clean_GLA", "Clean_Bsmt_Fin",
+        "MLS #", "Address", "Clean_Property_Type", "Clean_Price", "Clean_GLA", "Clean_Bsmt_Fin",
         "Clean_Year", "Clean_Beds", "Clean_FB", "Clean_HB",
         "Clean_Subdivision", "Clean_Date", "Clean_Garage"
     ])
@@ -963,18 +913,19 @@ with tab_manual:
         num_rows="dynamic",
         use_container_width=True,
         column_config={
-            "MLS #": st.column_config.TextColumn("Comp ID / MLS #", default="COMP"),
-            "Address": st.column_config.TextColumn("Street Address"),
-            "Clean_Price": st.column_config.NumberColumn("Sold Price ($)", min_value=0, step=1000),
-            "Clean_GLA": st.column_config.NumberColumn("Living Area (SF)", min_value=0, step=10),
-            "Clean_Bsmt_Fin": st.column_config.NumberColumn("Fin. Bsmt (SF)", min_value=0, step=50, default=0),
+            "MLS #": st.column_config.TextColumn("ID", default="COMP"),
+            "Address": st.column_config.TextColumn("Address"),
+            "Clean_Property_Type": st.column_config.SelectboxColumn("Type", options=["Detached", "Attached", "Condo"], default="Detached"),
+            "Clean_Price": st.column_config.NumberColumn("Sold Price", min_value=0, step=1000),
+            "Clean_GLA": st.column_config.NumberColumn("GLA", min_value=0, step=10),
+            "Clean_Bsmt_Fin": st.column_config.NumberColumn("Fin. Bsmt", min_value=0, step=50, default=0),
             "Clean_Year": st.column_config.NumberColumn("Year Built", min_value=1800, max_value=2030, step=1, default=2000),
-            "Clean_Beds": st.column_config.NumberColumn("Beds", min_value=0, max_value=15, step=1, default=3),
-            "Clean_FB": st.column_config.NumberColumn("Full Baths", min_value=0, max_value=15, step=1, default=2),
-            "Clean_HB": st.column_config.NumberColumn("Half Baths", min_value=0, max_value=10, step=1, default=0),
+            "Clean_Beds": st.column_config.NumberColumn("Beds", default=3),
+            "Clean_FB": st.column_config.NumberColumn("F Baths", default=2),
+            "Clean_HB": st.column_config.NumberColumn("H Baths", default=0),
             "Clean_Subdivision": st.column_config.TextColumn("Subdivision", default=""),
             "Clean_Date": st.column_config.DateColumn("Close Date"),
-            "Clean_Garage": st.column_config.NumberColumn("Garage Bays", min_value=0, max_value=10, step=1, default=2),
+            "Clean_Garage": st.column_config.NumberColumn("Garage Bays", default=2),
         }
     )
     if st.button("Use Manual Comps Table"):
@@ -983,14 +934,15 @@ with tab_manual:
         else:
             valid_manual = edited_manual_df[pd.to_numeric(edited_manual_df["Clean_Price"], errors="coerce") > 20000].copy()
             valid_manual["Clean_Date"] = pd.to_datetime(valid_manual["Clean_Date"], errors="coerce")
-            for col, default_val in [("Clean_Bsmt_Fin", 0.0), ("Clean_Year", 2000), ("Clean_Beds", 3), ("Clean_FB", 2), ("Clean_HB", 0), ("Clean_Garage", 2.0)]:
-                valid_manual[col] = pd.to_numeric(valid_manual[col], errors="coerce").fillna(default_val)
+            for col, dval in [("Clean_Bsmt_Fin", 0.0), ("Clean_Year", 2000), ("Clean_Beds", 3), ("Clean_FB", 2), ("Clean_HB", 0), ("Clean_Garage", 2.0)]:
+                valid_manual[col] = pd.to_numeric(valid_manual[col], errors="coerce").fillna(dval)
             valid_manual["Clean_Subdivision"] = valid_manual["Clean_Subdivision"].fillna("").astype(str)
+            valid_manual["Clean_Property_Type"] = valid_manual["Clean_Property_Type"].fillna("Detached").astype(str)
             st.session_state["active_comps_df"] = valid_manual
-            st.success(f"Loaded {len(valid_manual)} manual comparables into active dataset.")
+            st.success(f"Loaded {len(valid_manual)} manual comparables.")
 
 # ==============================================================================
-# SUBJECT PROPERTY VERIFICATION FORM (STARTS BLANK; AUTO-FILLS ON LOOKUP)
+# SUBJECT PROPERTY VERIFICATION FORM
 # ==============================================================================
 st.divider()
 st.subheader("Subject Property Parameters")
@@ -999,16 +951,9 @@ af = st.session_state.get("autofill_subject", {})
 col1, col2, col3 = st.columns(3)
 
 with col1:
-    subj_address = st.text_input(
-        "Subject Address:",
-        value=af.get("address", lookup_addr),
-        placeholder="Enter subject street address, city, NC, ZIP"
-    )
-    subj_subdivision = st.text_input(
-        "Subdivision (Optional - leave blank for radius/submarket):",
-        value=af.get("subdivision", ""),
-        placeholder="e.g., Oakwood or leave blank"
-    )
+    subj_address = st.text_input("Subject Address:", value=af.get("address", lookup_addr))
+    subj_prop_type = st.selectbox("Property Type:", ["Detached", "Attached", "Condo"], index=["Detached", "Attached", "Condo"].index(af.get("property_type", "Detached")))
+    subj_subdivision = st.text_input("Subdivision (Leave blank for radius):", value=af.get("subdivision", ""))
     subj_year = st.number_input("Year Built:", min_value=1800, max_value=2030, value=int(af.get("year_built", 2000)), step=1)
     subj_beds = st.number_input("Above-Grade Bedrooms:", min_value=0, max_value=15, value=int(af.get("beds", 3)), step=1)
 
@@ -1025,18 +970,12 @@ with col3:
 
 st.markdown("**Exterior Features & Amenities:**")
 am_cols = st.columns(6)
-with am_cols[0]:
-    has_front_porch = st.checkbox("Front Porch", value=False)
-with am_cols[1]:
-    has_screen_porch = st.checkbox("Screen Porch", value=False)
-with am_cols[2]:
-    has_deck = st.checkbox("Deck", value=False)
-with am_cols[3]:
-    has_patio = st.checkbox("Patio", value=False)
-with am_cols[4]:
-    has_fence = st.checkbox("Fenced Yard", value=False)
-with am_cols[5]:
-    has_pool = st.checkbox("Pool", value=False)
+with am_cols[0]: has_front_porch = st.checkbox("Front Porch", value=False)
+with am_cols[1]: has_screen_porch = st.checkbox("Screen Porch", value=False)
+with am_cols[2]: has_deck = st.checkbox("Deck", value=False)
+with am_cols[3]: has_patio = st.checkbox("Patio", value=False)
+with am_cols[4]: has_fence = st.checkbox("Fenced Yard", value=False)
+with am_cols[5]: has_pool = st.checkbox("Pool", value=False)
 
 # ==============================================================================
 # EXECUTION WORKFLOW
@@ -1044,23 +983,10 @@ with am_cols[5]:
 active_df = st.session_state.get("active_comps_df")
 
 if active_df is not None and not active_df.empty:
-    # Run empirical market conditions trend analysis on the loaded historical sales
-    if trend_mode == "Auto-Detect from Historical Data":
-        trend_info = calculate_historical_market_trend(active_df, str(val_date))
-    else:
-        trend_info = {
-            "monthly_pct": manual_trend_override,
-            "annual_pct": round(manual_trend_override * 12.0, 1),
-            "sample_size": len(active_df),
-            "span_days": 0,
-            "status": f"Manual override applied: {manual_trend_override:+.2f}%/mo ({manual_trend_override*12:+.1f}%/yr)."
-        }
-
-    st.info(f"📈 **Market Conditions Analysis:** {trend_info['status']}")
-
     subject_data = {
         "address": subj_address.strip(),
         "county": af.get("county", selected_county),
+        "property_type": subj_prop_type,
         "subdivision": subj_subdivision.strip(),
         "year_built": subj_year,
         "gla": subj_gla,
@@ -1073,22 +999,30 @@ if active_df is not None and not active_df.empty:
         "bsmt_fin": subj_bsmt_fin,
         "val_date": str(val_date),
         "val_mode": val_mode,
-        "monthly_trend_pct": trend_info["monthly_pct"],
         "amenities": {
-            "Front Porch": has_front_porch,
-            "Screen Porch": has_screen_porch,
-            "Deck": has_deck,
-            "Patio": has_patio,
-            "Fenced Yard": has_fence,
-            "Pool": has_pool
+            "Front Porch": has_front_porch, "Screen Porch": has_screen_porch,
+            "Deck": has_deck, "Patio": has_patio, "Fenced Yard": has_fence, "Pool": has_pool
         }
     }
 
+    if trend_mode == "Auto-Detect from Historical Data":
+        trend_info = calculate_historical_market_trend(active_df, subject_data)
+    else:
+        trend_info = {
+            "monthly_pct": manual_trend_override,
+            "annual_pct": round(manual_trend_override * 12.0, 1),
+            "sample_size": len(active_df[active_df['Clean_Property_Type'] == subj_prop_type]),
+            "span_days": 0,
+            "status": f"Manual override: {manual_trend_override:+.2f}%/mo."
+        }
+    subject_data["monthly_trend_pct"] = trend_info["monthly_pct"]
+    st.info(f"📈 **Market Conditions Analysis:** {trend_info['status']}")
+
     manual_ids = []
     if comp_mode == "Manual Override (Pick Specific Comps)":
-        mls_options = active_df['MLS #'].tolist()
+        mls_options = active_df[active_df['Clean_Property_Type'] == subj_prop_type]['MLS #'].tolist()
         format_func = lambda x: f"{x} - {active_df[active_df['MLS #']==x]['Address'].values[0]} (${active_df[active_df['MLS #']==x]['Clean_Price'].values[0]:,.0f})"
-        manual_ids = st.multiselect("Choose 3 to 4 Preferred Comparables:", mls_options, format_func=format_func)
+        manual_ids = st.multiselect(f"Choose 3 to 4 {subj_prop_type} Comparables:", mls_options, format_func=format_func)
 
     if st.button("Generate Market Range & Defense Brief", type="primary", use_container_width=True):
         if not subject_data["address"]:
@@ -1101,7 +1035,7 @@ if active_df is not None and not active_df.empty:
             comps_df = select_comparables_with_subdivision(active_df, subject_data, reg_params, mode=mode_key, manual_mls_ids=manual_ids)
 
             if comps_df.empty:
-                st.error("No valid comparables matched the selection criteria.")
+                st.error(f"No valid {subj_prop_type} comparables found within the past 12 months. Try expanding your search radius.")
             else:
                 grid_df = calculate_grid_adjustments(comps_df, subject_data, reg_params)
 
@@ -1118,7 +1052,7 @@ if active_df is not None and not active_df.empty:
                 k3.metric("Indicated Range", f"${min_ind:,.0f} - ${max_ind:,.0f}")
                 k4.metric("Extracted Market Trend", f"{trend_info['monthly_pct']:+.2f}% / mo")
 
-                st.markdown("### Comparable Sales Adjustment Grid")
+                st.markdown(f"### Comparable Sales Adjustment Grid (Strict {subj_prop_type} & <12 Mos)")
                 st.dataframe(
                     grid_df[['address', 'subdivision', 'contract_date', 'price', 'gla', 'rooms', 'time_adj', 'gla_adj', 'room_adj', 'gar_adj', 'bsmt_adj', 'other_adj', 'net_adj', 'gross_pct', 'indicated']],
                     use_container_width=True
