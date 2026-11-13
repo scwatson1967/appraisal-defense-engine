@@ -1,5 +1,6 @@
 import os
 import re
+import math
 from io import BytesIO
 from datetime import date
 import requests
@@ -77,7 +78,7 @@ def sanitize_for_pdf(text: str) -> str:
     return text.strip()
 
 # ==============================================================================
-# DATA INGESTION & NORMALIZATION (CSV, FREE NC ONEMAP, OR MANUAL)
+# DATA INGESTION & NORMALIZATION (CSV, FREE NC GIS/ONEMAP, OR MANUAL)
 # ==============================================================================
 def clean_currency(val) -> float:
     if pd.isna(val):
@@ -146,12 +147,13 @@ def load_and_clean_csv(file) -> pd.DataFrame:
 
     return df
 
-def fetch_comps_from_nconemap(address: str, radius_miles: float, default_gla: int = 2000) -> tuple[dict, pd.DataFrame]:
+def fetch_comps_from_nconemap(address: str, radius_miles: float) -> tuple[dict, pd.DataFrame]:
     """
-    Free, keyless lookup using NC OneMap / ArcGIS Geocoder + NC1Map_Parcels REST API.
-    Covers Wake, Durham, Orange, Johnston, Cumberland, Franklin, Chatham, and Granville counties.
+    Free, keyless public records lookup:
+    - Uses Wake County GIS Parcels REST API for Wake County (real deed TOTSALPRICE & HEATEDAREA).
+    - Uses NC OneMap Statewide Parcels REST API (parval / improvval / saledate) for Durham, Orange,
+      Johnston, Cumberland, Franklin, Chatham, and Granville counties.
     """
-    # 1. Geocode street address using ArcGIS World/Address Geocoder (keyless for single-line lookup)
     geo_url = "https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates"
     geo_params = {
         "SingleLine": address.strip(),
@@ -163,95 +165,150 @@ def fetch_comps_from_nconemap(address: str, radius_miles: float, default_gla: in
     g_resp.raise_for_status()
     candidates = g_resp.json().get("candidates", [])
     if not candidates:
-        raise ValueError("Address could not be geocoded. Please include City, State, and ZIP.")
+        raise ValueError("Address could not be geocoded. Please include Street, City, NC, and ZIP.")
 
     best = candidates[0]
-    lon = best["location"]["x"]
-    lat = best["location"]["y"]
+    lon = float(best["location"]["x"])
+    lat = float(best["location"]["y"])
     attrs = best.get("attributes", {})
     detected_county = str(attrs.get("Subregion") or "Wake").replace(" County", "").strip()
     if detected_county not in NC_COUNTY_CONFIG:
         detected_county = "Wake"
 
-    # 2. Query NC OneMap Statewide Parcels Layer (Point layer ID 0) within radius
-    parcel_url = "https://services.nconemap.gov/secure/rest/services/NC1Map_Parcels/MapServer/0/query"
-    radius_meters = float(radius_miles) * 1609.34
-    p_params = {
-        "geometry": f"{lon},{lat}",
-        "geometryType": "esriGeometryPoint",
-        "inSR": "4326",
-        "spatialRel": "esriSpatialRelIntersects",
-        "distance": radius_meters,
-        "units": "esriSRUnit_Meter",
-        "outFields": "*",
-        "returnGeometry": "false",
-        "f": "json"
-    }
-    p_resp = requests.get(parcel_url, params=p_params, timeout=20)
-    p_resp.raise_for_status()
-    features = p_resp.json().get("features", [])
+    lat_deg = float(radius_miles) / 69.0
+    lon_deg = float(radius_miles) / (69.0 * max(math.cos(math.radians(lat)), 0.1))
+    envelope = f"{lon - lon_deg},{lat - lat_deg},{lon + lon_deg},{lat + lat_deg}"
 
     subject_autofill = {
-        "address": attrs.get("Match_addr") or address,
+        "address": attrs.get("Match_addr") or address.strip(),
         "county": detected_county,
         "subdivision": "",
         "year_built": 2000,
-        "gla": default_gla,
+        "gla": 0,
         "beds": 3,
         "baths_full": 2,
-        "baths_half": 1,
+        "baths_half": 0,
     }
 
+    street_num = address.strip().split(" ")[0].lower()
     rows = []
-    for idx, feat in enumerate(features):
-        a = feat.get("attributes") or {}
-        # NC OneMap standardized parcel fields (with fallbacks for county variations)
-        sale_price = float(a.get("saleprice") or a.get("SALEPRICE") or a.get("totval") or a.get("TOTVAL") or 0)
-        if sale_price <= 35000:
-            continue
 
-        site_addr = str(a.get("siteadd") or a.get("SITEADD") or a.get("mailadd") or f"Parcel {a.get('parno', idx+1)}").strip()
-        subd = str(a.get("subdiv") or a.get("SUBDIV") or "").strip()
-        yr_built = int(a.get("yrbuilt") or a.get("YRBUILT") or 2000)
-        if yr_built < 1800 or yr_built > 2027:
-            yr_built = 2000
+    # 1. WAKE COUNTY DIRECT GIS ENDPOINT (Actual Sale Prices + Heated SqFt)
+    if detected_county == "Wake":
+        wake_url = "https://maps.wakegov.com/arcgis/rest/services/Property/Parcels/MapServer/0/query"
+        w_params = {
+            "geometry": envelope,
+            "geometryType": "esriGeometryEnvelope",
+            "inSR": "4326",
+            "spatialRel": "esriSpatialRelIntersects",
+            "where": "HEATEDAREA > 500",
+            "outFields": "*",
+            "returnGeometry": "false",
+            "resultRecordCount": 150,
+            "f": "json"
+        }
+        w_resp = requests.get(wake_url, params=w_params, timeout=20)
+        w_resp.raise_for_status()
+        features = w_resp.json().get("features", [])
 
-        # Use heated area if county populates it; otherwise estimate from tax value / median $/SF
-        raw_gla = float(a.get("sqft") or a.get("SQFT") or a.get("heatedarea") or a.get("HEATEDAREA") or 0)
-        if raw_gla <= 400:
-            raw_gla = round(sale_price / 215.0, -1)
+        for idx, feat in enumerate(features):
+            a = feat.get("attributes") or {}
+            site_addr = str(a.get("SITE_ADDRESS") or a.get("FULL_STREET_NAME") or f"Wake Parcel {idx+1}").strip()
+            heated = float(a.get("HEATEDAREA") or 0)
+            yr_built = int(a.get("YEAR_BUILT") or 2000)
+            subd = str(a.get("SUBDIVISION") or a.get("MAP_NAME") or "").strip()
 
-        raw_sale_dt = a.get("saledate") or a.get("SALEDATE")
-        if isinstance(raw_sale_dt, (int, float)) and raw_sale_dt > 0:
-            clean_dt = pd.to_datetime(raw_sale_dt, unit="ms", errors="coerce")
-        else:
-            clean_dt = pd.to_datetime(raw_sale_dt, errors="coerce")
-        if pd.isna(clean_dt):
-            clean_dt = pd.to_datetime("today") - pd.Timedelta(days=90)
+            sale_price = float(a.get("TOTSALPRICE") or 0)
+            if sale_price <= 35000:
+                sale_price = float(a.get("TOTAL_VALUE_ASSD") or 0)
+            if sale_price <= 35000 or heated <= 500:
+                continue
 
-        # Match subject parcel if address starts with same street number
-        street_num = address.strip().split(" ")[0].lower()
-        if site_addr.lower().startswith(street_num + " "):
-            subject_autofill["subdivision"] = subd
-            subject_autofill["year_built"] = yr_built
-            if raw_gla > 400:
-                subject_autofill["gla"] = int(raw_gla)
-            continue
+            raw_dt = a.get("SALE_DATE") or a.get("DEED_DATE")
+            if isinstance(raw_dt, (int, float)) and raw_dt > 0:
+                clean_dt = pd.to_datetime(raw_dt, unit="ms", errors="coerce")
+            else:
+                clean_dt = pd.to_datetime(raw_dt, errors="coerce")
+            if pd.isna(clean_dt):
+                clean_dt = pd.to_datetime("today") - pd.Timedelta(days=120)
 
-        rows.append({
-            "MLS #": str(a.get("parno") or a.get("PARNO") or f"NCMAP-{idx+1}"),
-            "Address": site_addr,
-            "Clean_Price": sale_price,
-            "Clean_GLA": raw_gla,
-            "Clean_Bsmt_Fin": 0.0,
-            "Clean_Year": yr_built,
-            "Clean_Beds": int(a.get("bedrooms") or 3),
-            "Clean_FB": int(a.get("fullbaths") or 2),
-            "Clean_HB": int(a.get("halfbaths") or 0),
-            "Clean_Subdivision": subd,
-            "Clean_Date": clean_dt,
-            "Clean_Garage": 2.0,
-        })
+            if site_addr.lower().startswith(street_num + " "):
+                subject_autofill["gla"] = int(heated)
+                if 1800 < yr_built <= 2027:
+                    subject_autofill["year_built"] = yr_built
+                if subd:
+                    subject_autofill["subdivision"] = subd
+                continue
+
+            rows.append({
+                "MLS #": str(a.get("PIN_NUM") or a.get("REID") or f"WAKE-{idx+1}"),
+                "Address": site_addr,
+                "Clean_Price": sale_price,
+                "Clean_GLA": heated,
+                "Clean_Bsmt_Fin": 0.0,
+                "Clean_Year": yr_built if 1800 < yr_built <= 2027 else 2000,
+                "Clean_Beds": 3,
+                "Clean_FB": 2,
+                "Clean_HB": 1,
+                "Clean_Subdivision": subd,
+                "Clean_Date": clean_dt,
+                "Clean_Garage": 2.0,
+            })
+
+    # 2. ALL OTHER 7 COUNTIES VIA NC ONEMAP STATEWIDE PARCELS
+    if not rows:
+        parcel_url = "https://services.nconemap.gov/secure/rest/services/NC1Map_Parcels/MapServer/0/query"
+        p_params = {
+            "geometry": envelope,
+            "geometryType": "esriGeometryEnvelope",
+            "inSR": "4326",
+            "spatialRel": "esriSpatialRelIntersects",
+            "where": "parval > 40000 AND improvval > 20000",
+            "outFields": "parno,siteadd,scity,parval,improvval,landval,saledate,gisacres,cntyname",
+            "returnGeometry": "false",
+            "resultRecordCount": 150,
+            "f": "json"
+        }
+        p_resp = requests.get(parcel_url, params=p_params, timeout=20)
+        p_resp.raise_for_status()
+        features = p_resp.json().get("features", [])
+
+        for idx, feat in enumerate(features):
+            a = feat.get("attributes") or {}
+            par_val = float(a.get("parval") or a.get("PARVAL") or 0)
+            imp_val = float(a.get("improvval") or a.get("IMPROVVAL") or 0)
+            if par_val <= 40000 or imp_val <= 20000:
+                continue
+
+            site_addr = str(a.get("siteadd") or a.get("SITEADD") or f"Parcel {a.get('parno', idx+1)}").strip()
+            est_gla = round(max(imp_val / 165.0, 900.0), -1)
+
+            raw_dt = a.get("saledate") or a.get("SALEDATE")
+            if isinstance(raw_dt, (int, float)) and raw_dt > 0:
+                clean_dt = pd.to_datetime(raw_dt, unit="ms", errors="coerce")
+            else:
+                clean_dt = pd.to_datetime(raw_dt, errors="coerce")
+            if pd.isna(clean_dt):
+                clean_dt = pd.to_datetime("today") - pd.Timedelta(days=120)
+
+            if site_addr.lower().startswith(street_num + " "):
+                subject_autofill["gla"] = int(est_gla)
+                continue
+
+            rows.append({
+                "MLS #": str(a.get("parno") or a.get("PARNO") or f"NCMAP-{idx+1}"),
+                "Address": site_addr,
+                "Clean_Price": par_val,
+                "Clean_GLA": est_gla,
+                "Clean_Bsmt_Fin": 0.0,
+                "Clean_Year": 2000,
+                "Clean_Beds": 3,
+                "Clean_FB": 2,
+                "Clean_HB": 0,
+                "Clean_Subdivision": "",
+                "Clean_Date": clean_dt,
+                "Clean_Garage": 2.0,
+            })
 
     return subject_autofill, pd.DataFrame(rows)
 
@@ -521,11 +578,18 @@ def generate_narrative_groq(api_key: str, subject: dict, reg_params: dict, grid_
         active_ids = [m.id for m in models_data]
 
         preferred_models = [
+            "openai/gpt-oss-120b",
+            "qwen/qwen3.6-27b",
+            "openai/gpt-oss-20b",
             "llama-3.3-70b-versatile",
-            "llama-3.1-70b-versatile",
-            "llama-3.1-8b-instant",
         ]
-        chosen_model = next((m for m in preferred_models if m in active_ids), "llama-3.3-70b-versatile")
+        chosen_model = next((m for m in preferred_models if m in active_ids), None)
+        if not chosen_model:
+            chat_candidates = [
+                m for m in active_ids
+                if not any(b in m.lower() for b in ["guard", "whisper", "vision", "embed", "orpheus"])
+            ]
+            chosen_model = chat_candidates[0] if chat_candidates else "openai/gpt-oss-120b"
 
         comp_lines = "\n".join([
             f"- {r['address']} ({r['subdivision']}): {int(r['gla']):,} SF, {r['rooms']}, Closed ${r['price']:,.0f}, TimeAdj ${r['time_adj']:+,.0f}, Indicated ${r['indicated']:,.0f}"
@@ -750,33 +814,40 @@ with st.sidebar:
         st.info("Running Deterministic Narrative Mode")
 
 # ==============================================================================
-# MAIN INTERFACE: 3-TAB MULTI-COUNTY INTAKE
+# MAIN INTERFACE: 3-TAB MULTI-COUNTY INTAKE (NO PREDETERMINED SUBJECT DATA)
 # ==============================================================================
 st.markdown('<div class="report-header">8-County NC Valuation & Listing Defense Engine</div>', unsafe_allow_html=True)
 st.markdown('<div class="sub-header">Wake • Durham • Orange • Johnston • Cumberland • Franklin • Chatham • Granville</div>', unsafe_allow_html=True)
 
 tab_addr, tab_csv, tab_manual = st.tabs([
-    "1. Address Lookup (Free NC OneMap Public Records)",
+    "1. Address Lookup (Free Public Records)",
     "2. Upload MLS CSV (Realtors / Internal)",
     "3. Manual Comp Grid (Fallback)"
 ])
 
 with tab_addr:
-    st.markdown("Enter any residential street address across our 8-county coverage area to query NC OneMap public parcel records automatically (no API key required).")
-    lookup_addr = st.text_input("Property Street Address, City, State, ZIP:", value="213 Hillstone Dr, Raleigh, NC 27615")
+    st.markdown("Enter a residential street address in Wake, Durham, Orange, Johnston, Cumberland, Franklin, Chatham, or Granville County to pull public parcel and sales records.")
+    lookup_addr = st.text_input(
+        "Property Street Address, City, State, ZIP:",
+        value="",
+        placeholder="e.g., 123 Main St, Raleigh, NC 27601"
+    )
 
-    if st.button("Fetch NC OneMap Parcel & Comparable Data"):
-        with st.spinner(f"Querying NC OneMap parcels within {search_radius} miles..."):
-            try:
-                subj_auto, api_df = fetch_comps_from_nconemap(lookup_addr, search_radius)
-                if api_df.empty:
-                    st.error("No parcel sales records returned within that radius. Try increasing the Search Radius in the sidebar or use Tab 2 / Tab 3.")
-                else:
-                    st.session_state["autofill_subject"] = subj_auto
-                    st.session_state["active_comps_df"] = api_df
-                    st.success(f"Found {len(api_df)} nearby parcel records in {subj_auto['county']} County. Verify subject specs below and click Generate.")
-            except Exception as e:
-                st.error(f"NC OneMap lookup failed: {e}")
+    if st.button("Fetch Public Parcel & Comparable Data"):
+        if not lookup_addr.strip():
+            st.warning("Please enter a property street address, city, and ZIP code first.")
+        else:
+            with st.spinner(f"Querying public parcel records within {search_radius} miles..."):
+                try:
+                    subj_auto, api_df = fetch_comps_from_nconemap(lookup_addr, search_radius)
+                    if api_df.empty:
+                        st.error("No parcel sales records returned within that radius. Try increasing the Search Radius in the sidebar or use Tab 2 / Tab 3.")
+                    else:
+                        st.session_state["autofill_subject"] = subj_auto
+                        st.session_state["active_comps_df"] = api_df
+                        st.success(f"Found {len(api_df)} nearby parcel records in {subj_auto['county']} County. Verify subject specs below and click Generate.")
+                except Exception as e:
+                    st.error(f"Public records lookup failed: {e}")
 
 with tab_csv:
     st.markdown("Upload a Doorify / Triangle MLS or Longleaf Pine MLS CSV export.")
@@ -787,64 +858,96 @@ with tab_csv:
         st.success(f"Loaded {len(csv_df)} market records from MLS CSV.")
 
 with tab_manual:
-    st.markdown("Enter or paste 3 to 6 recent neighborhood sales directly if public records are sparse (e.g., rural acreage in Chatham, Franklin, or Granville).")
-    default_manual = pd.DataFrame([
-        {"MLS #": "COMP-1", "Address": "105 Sample Way", "Clean_Price": 445000.0, "Clean_GLA": 1950.0, "Clean_Bsmt_Fin": 0.0, "Clean_Year": 1992, "Clean_Beds": 3, "Clean_FB": 2, "Clean_HB": 1, "Clean_Subdivision": "Chadwick", "Clean_Date": pd.to_datetime("2026-08-15"), "Clean_Garage": 2.0},
-        {"MLS #": "COMP-2", "Address": "312 Sample Ct", "Clean_Price": 472000.0, "Clean_GLA": 2120.0, "Clean_Bsmt_Fin": 0.0, "Clean_Year": 1994, "Clean_Beds": 4, "Clean_FB": 2, "Clean_HB": 1, "Clean_Subdivision": "Chadwick", "Clean_Date": pd.to_datetime("2026-09-20"), "Clean_Garage": 2.0},
-        {"MLS #": "COMP-3", "Address": "408 Nearby Rd", "Clean_Price": 430000.0, "Clean_GLA": 1880.0, "Clean_Bsmt_Fin": 0.0, "Clean_Year": 1990, "Clean_Beds": 3, "Clean_FB": 2, "Clean_HB": 0, "Clean_Subdivision": "Chadwick", "Clean_Date": pd.to_datetime("2026-07-10"), "Clean_Garage": 2.0},
+    st.markdown("Enter or paste 3 to 6 recent neighborhood sales directly if public records are sparse.")
+    empty_manual = pd.DataFrame(columns=[
+        "MLS #", "Address", "Clean_Price", "Clean_GLA", "Clean_Bsmt_Fin",
+        "Clean_Year", "Clean_Beds", "Clean_FB", "Clean_HB",
+        "Clean_Subdivision", "Clean_Date", "Clean_Garage"
     ])
-    edited_manual_df = st.data_editor(default_manual, num_rows="dynamic", use_container_width=True)
+    edited_manual_df = st.data_editor(
+        empty_manual,
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "MLS #": st.column_config.TextColumn("Comp ID / MLS #", default="COMP"),
+            "Address": st.column_config.TextColumn("Street Address"),
+            "Clean_Price": st.column_config.NumberColumn("Sold Price ($)", min_value=0, step=1000),
+            "Clean_GLA": st.column_config.NumberColumn("Living Area (SF)", min_value=0, step=10),
+            "Clean_Bsmt_Fin": st.column_config.NumberColumn("Fin. Bsmt (SF)", min_value=0, step=50, default=0),
+            "Clean_Year": st.column_config.NumberColumn("Year Built", min_value=1800, max_value=2030, step=1, default=2000),
+            "Clean_Beds": st.column_config.NumberColumn("Beds", min_value=0, max_value=15, step=1, default=3),
+            "Clean_FB": st.column_config.NumberColumn("Full Baths", min_value=0, max_value=15, step=1, default=2),
+            "Clean_HB": st.column_config.NumberColumn("Half Baths", min_value=0, max_value=10, step=1, default=0),
+            "Clean_Subdivision": st.column_config.TextColumn("Subdivision", default=""),
+            "Clean_Date": st.column_config.DateColumn("Close Date"),
+            "Clean_Garage": st.column_config.NumberColumn("Garage Bays", min_value=0, max_value=10, step=1, default=2),
+        }
+    )
     if st.button("Use Manual Comps Table"):
-        valid_manual = edited_manual_df[edited_manual_df["Clean_Price"] > 20000].copy()
-        valid_manual["Clean_Date"] = pd.to_datetime(valid_manual["Clean_Date"], errors="coerce")
-        st.session_state["active_comps_df"] = valid_manual
-        st.success(f"Loaded {len(valid_manual)} manual comparables into active dataset.")
+        if edited_manual_df.empty:
+            st.warning("Add at least 3 comparable rows to the table first.")
+        else:
+            valid_manual = edited_manual_df[pd.to_numeric(edited_manual_df["Clean_Price"], errors="coerce") > 20000].copy()
+            valid_manual["Clean_Date"] = pd.to_datetime(valid_manual["Clean_Date"], errors="coerce")
+            for col, default_val in [("Clean_Bsmt_Fin", 0.0), ("Clean_Year", 2000), ("Clean_Beds", 3), ("Clean_FB", 2), ("Clean_HB", 0), ("Clean_Garage", 2.0)]:
+                valid_manual[col] = pd.to_numeric(valid_manual[col], errors="coerce").fillna(default_val)
+            valid_manual["Clean_Subdivision"] = valid_manual["Clean_Subdivision"].fillna("").astype(str)
+            st.session_state["active_comps_df"] = valid_manual
+            st.success(f"Loaded {len(valid_manual)} manual comparables into active dataset.")
 
 # ==============================================================================
-# SUBJECT PROPERTY VERIFICATION FORM (AUTO-FILLED WHEN AVAILABLE)
+# SUBJECT PROPERTY VERIFICATION FORM (STARTS BLANK; AUTO-FILLS ON LOOKUP)
 # ==============================================================================
 st.divider()
-st.subheader("Verify Subject Property Parameters")
+st.subheader("Subject Property Parameters")
 af = st.session_state.get("autofill_subject", {})
 
 col1, col2, col3 = st.columns(3)
 
 with col1:
-    subj_address = st.text_input("Subject Address:", value=af.get("address", lookup_addr))
-    subj_subdivision = st.text_input("Subdivision (Leave empty for submarket):", value=af.get("subdivision", "Chadwick"))
-    subj_year = st.number_input("Year Built:", value=int(af.get("year_built", 1991)), step=1)
-    subj_beds = st.number_input("Above-Grade Bedrooms:", value=int(af.get("beds", 3)), step=1)
+    subj_address = st.text_input(
+        "Subject Address:",
+        value=af.get("address", lookup_addr),
+        placeholder="Enter subject street address, city, NC, ZIP"
+    )
+    subj_subdivision = st.text_input(
+        "Subdivision (Optional - leave blank for radius/submarket):",
+        value=af.get("subdivision", ""),
+        placeholder="e.g., Oakwood or leave blank"
+    )
+    subj_year = st.number_input("Year Built:", min_value=1800, max_value=2030, value=int(af.get("year_built", 2000)), step=1)
+    subj_beds = st.number_input("Above-Grade Bedrooms:", min_value=0, max_value=15, value=int(af.get("beds", 3)), step=1)
 
 with col2:
-    subj_gla = st.number_input("Above-Grade Measured GLA (SF):", value=int(af.get("gla", 2004)), step=10)
-    subj_bsmt_fin = st.number_input("Below-Grade Finished Basement (SF):", value=0, step=50)
-    subj_fb = st.number_input("Above-Grade Full Baths:", value=int(af.get("baths_full", 2)), step=1)
-    subj_hb = st.number_input("Above-Grade Half Baths:", value=int(af.get("baths_half", 1)), step=1)
+    subj_gla = st.number_input("Above-Grade Measured GLA (SF):", min_value=0, max_value=25000, value=int(af.get("gla", 0)), step=10)
+    subj_bsmt_fin = st.number_input("Below-Grade Finished Basement (SF):", min_value=0, max_value=15000, value=0, step=50)
+    subj_fb = st.number_input("Above-Grade Full Baths:", min_value=0, max_value=15, value=int(af.get("baths_full", 2)), step=1)
+    subj_hb = st.number_input("Above-Grade Half Baths:", min_value=0, max_value=10, value=int(af.get("baths_half", 0)), step=1)
 
 with col3:
     subj_condition = st.selectbox("Condition Rating:", ["Average", "Good", "Excellent", "Fair"])
-    subj_garage = st.number_input("Garage Bays:", value=2, step=1)
-    subj_fireplaces = st.number_input("Fireplaces:", value=1, step=1)
+    subj_garage = st.number_input("Garage Bays:", min_value=0, max_value=10, value=2, step=1)
+    subj_fireplaces = st.number_input("Fireplaces:", min_value=0, max_value=10, value=0, step=1)
 
 st.markdown("**Exterior Features & Amenities:**")
 am_cols = st.columns(6)
 with am_cols[0]:
-    has_front_porch = st.checkbox("Front Porch", value=True)
+    has_front_porch = st.checkbox("Front Porch", value=False)
 with am_cols[1]:
     has_screen_porch = st.checkbox("Screen Porch", value=False)
 with am_cols[2]:
-    has_deck = st.checkbox("Deck", value=True)
+    has_deck = st.checkbox("Deck", value=False)
 with am_cols[3]:
-    has_patio = st.checkbox("Patio", value=True)
+    has_patio = st.checkbox("Patio", value=False)
 with am_cols[4]:
     has_fence = st.checkbox("Fenced Yard", value=False)
 with am_cols[5]:
     has_pool = st.checkbox("Pool", value=False)
 
 subject_data = {
-    "address": subj_address,
+    "address": subj_address.strip(),
     "county": af.get("county", selected_county),
-    "subdivision": subj_subdivision,
+    "subdivision": subj_subdivision.strip(),
     "year_built": subj_year,
     "gla": subj_gla,
     "beds": subj_beds,
@@ -873,8 +976,6 @@ subject_data = {
 active_df = st.session_state.get("active_comps_df")
 
 if active_df is not None and not active_df.empty:
-    reg_params = run_regression_analysis(active_df, subject_data)
-
     manual_ids = []
     if comp_mode == "Manual Override (Pick Specific Comps)":
         mls_options = active_df['MLS #'].tolist()
@@ -882,44 +983,50 @@ if active_df is not None and not active_df.empty:
         manual_ids = st.multiselect("Choose 3 to 4 Preferred Comparables:", mls_options, format_func=format_func)
 
     if st.button("Generate Market Range & Defense Brief", type="primary", use_container_width=True):
-        mode_key = "manual" if comp_mode == "Manual Override (Pick Specific Comps)" else "algorithmic"
-        comps_df = select_comparables_with_subdivision(active_df, subject_data, reg_params, mode=mode_key, manual_mls_ids=manual_ids)
-
-        if comps_df.empty:
-            st.error("No valid comparables matched the selection criteria.")
+        if not subject_data["address"]:
+            st.error("Please enter the Subject Address before generating the brief.")
+        elif subject_data["gla"] <= 100:
+            st.error("Please enter the Subject Above-Grade Measured GLA (SF) greater than 100 SF.")
         else:
-            grid_df = calculate_grid_adjustments(comps_df, subject_data, reg_params)
+            reg_params = run_regression_analysis(active_df, subject_data)
+            mode_key = "manual" if comp_mode == "Manual Override (Pick Specific Comps)" else "algorithmic"
+            comps_df = select_comparables_with_subdivision(active_df, subject_data, reg_params, mode=mode_key, manual_mls_ids=manual_ids)
 
-            with st.spinner("Compiling market narrative..."):
-                narrative = generate_narrative_groq(groq_api_key, subject_data, reg_params, grid_df)
+            if comps_df.empty:
+                st.error("No valid comparables matched the selection criteria.")
+            else:
+                grid_df = calculate_grid_adjustments(comps_df, subject_data, reg_params)
 
-            min_ind = int(grid_df['indicated'].min())
-            max_ind = int(grid_df['indicated'].max())
-            mid_ind = int((min_ind + max_ind) / 2)
+                with st.spinner("Compiling market narrative..."):
+                    narrative = generate_narrative_groq(groq_api_key, subject_data, reg_params, grid_df)
 
-            k1, k2, k3, k4 = st.columns(4)
-            k1.metric("Hedonic Benchmark", f"${reg_params['benchmark']:,.0f}")
-            k2.metric("Indicated Midpoint", f"${mid_ind:,.0f}")
-            k3.metric("Indicated Range", f"${min_ind:,.0f} - ${max_ind:,.0f}")
-            k4.metric("Extracted GLA Rate", f"${reg_params['gla_rate']}/SF")
+                min_ind = int(grid_df['indicated'].min())
+                max_ind = int(grid_df['indicated'].max())
+                mid_ind = int((min_ind + max_ind) / 2)
 
-            st.markdown("### Comparable Sales Adjustment Grid")
-            st.dataframe(
-                grid_df[['address', 'subdivision', 'contract_date', 'price', 'gla', 'rooms', 'time_adj', 'gla_adj', 'room_adj', 'gar_adj', 'bsmt_adj', 'other_adj', 'net_adj', 'gross_pct', 'indicated']],
-                use_container_width=True
-            )
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("Hedonic Benchmark", f"${reg_params['benchmark']:,.0f}")
+                k2.metric("Indicated Midpoint", f"${mid_ind:,.0f}")
+                k3.metric("Indicated Range", f"${min_ind:,.0f} - ${max_ind:,.0f}")
+                k4.metric("Extracted GLA Rate", f"${reg_params['gla_rate']}/SF")
 
-            with st.expander("Preview Executive Market Narrative", expanded=True):
-                st.write(narrative, unsafe_allow_html=True)
+                st.markdown("### Comparable Sales Adjustment Grid")
+                st.dataframe(
+                    grid_df[['address', 'subdivision', 'contract_date', 'price', 'gla', 'rooms', 'time_adj', 'gla_adj', 'room_adj', 'gar_adj', 'bsmt_adj', 'other_adj', 'net_adj', 'gross_pct', 'indicated']],
+                    use_container_width=True
+                )
 
-            pdf_bytes = build_pdf_report(subject_data, reg_params, grid_df, narrative)
-            clean_filename = f"Market_Brief_{re.sub(r'[^a-zA-Z0-9]', '_', subj_address)}.pdf"
-            st.download_button(
-                label="📥 Download Market Range & Defense Brief (PDF)",
-                data=pdf_bytes,
-                file_name=clean_filename,
-                mime="application/pdf",
-                use_container_width=True
-            )
+                with st.expander("Preview Executive Market Narrative", expanded=True):
+                    st.write(narrative, unsafe_allow_html=True)
+
+                pdf_bytes = build_pdf_report(subject_data, reg_params, grid_df, narrative)
+                clean_filename = f"Market_Brief_{re.sub(r'[^a-zA-Z0-9]', '_', subj_address)}.pdf"
+                st.download_button(
+                    label="📥 Download Market Range & Defense Brief (PDF)",
+                    data=pdf_bytes,
+                    file_name=clean_filename,
+                    mime="application/pdf",
+                    use_container_width=True
+                )
 else:
-    st.info("Use Tab 1 (Free NC OneMap Lookup), Tab 2 (Upload MLS CSV), or Tab 3 (Manual Comp Grid) above to load comparable sales.")
+    st.info("Use Tab 1 (Free Public Records Lookup), Tab 2 (Upload MLS CSV), or Tab 3 (Manual Comp Grid) above to load comparable sales.")
