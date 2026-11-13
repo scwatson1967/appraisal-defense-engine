@@ -32,14 +32,14 @@ st.markdown("""
 # 8-COUNTY NC ADAPTIVE RADIUS CONFIGURATION
 # ==============================================================================
 NC_COUNTY_CONFIG = {
-    "Wake": {"default_radius": 0.75, "tier": "Urban/Suburban Core", "monthly_trend_pct": -0.20},
-    "Durham": {"default_radius": 0.75, "tier": "Urban/Suburban Core", "monthly_trend_pct": -0.15},
-    "Cumberland": {"default_radius": 1.00, "tier": "Metro Military Core", "monthly_trend_pct": 0.00},
-    "Orange": {"default_radius": 1.25, "tier": "Mixed Suburban/Rural", "monthly_trend_pct": 0.00},
-    "Johnston": {"default_radius": 1.50, "tier": "Suburban/Exurban Growth", "monthly_trend_pct": -0.15},
-    "Chatham": {"default_radius": 2.25, "tier": "Suburban/Rural Acreage", "monthly_trend_pct": 0.00},
-    "Franklin": {"default_radius": 2.50, "tier": "Rural/Exurban", "monthly_trend_pct": -0.10},
-    "Granville": {"default_radius": 2.50, "tier": "Rural/Exurban", "monthly_trend_pct": -0.10},
+    "Wake": {"default_radius": 0.75, "tier": "Urban/Suburban Core"},
+    "Durham": {"default_radius": 0.75, "tier": "Urban/Suburban Core"},
+    "Cumberland": {"default_radius": 1.00, "tier": "Metro Military Core"},
+    "Orange": {"default_radius": 1.25, "tier": "Mixed Suburban/Rural"},
+    "Johnston": {"default_radius": 1.50, "tier": "Suburban/Exurban Growth"},
+    "Chatham": {"default_radius": 2.25, "tier": "Suburban/Rural Acreage"},
+    "Franklin": {"default_radius": 2.50, "tier": "Rural/Exurban"},
+    "Granville": {"default_radius": 2.50, "tier": "Rural/Exurban"},
 }
 
 # ==============================================================================
@@ -150,9 +150,9 @@ def load_and_clean_csv(file) -> pd.DataFrame:
 def fetch_comps_from_nconemap(address: str, radius_miles: float) -> tuple[dict, pd.DataFrame]:
     """
     Free, keyless public records lookup:
-    - Uses Wake County GIS Parcels REST API for Wake County (real deed TOTSALPRICE & HEATEDAREA).
-    - Uses NC OneMap Statewide Parcels REST API (parval / improvval / saledate) for Durham, Orange,
-      Johnston, Cumberland, Franklin, Chatham, and Granville counties.
+    - Uses ArcGIS Geocoder for exact coordinates & county detection.
+    - Tries Wake County's ArcGIS Online Parcels FeatureServer for Wake County, with automatic
+      fallback to NC OneMap Statewide Parcels REST API for all 8 counties.
     """
     geo_url = "https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates"
     geo_params = {
@@ -193,69 +193,70 @@ def fetch_comps_from_nconemap(address: str, radius_miles: float) -> tuple[dict, 
     street_num = address.strip().split(" ")[0].lower()
     rows = []
 
-    # 1. WAKE COUNTY DIRECT GIS ENDPOINT (Actual Sale Prices + Heated SqFt)
+    # 1. TRY WAKE COUNTY ARCGIS ONLINE FEATURE SERVER
     if detected_county == "Wake":
-        wake_url = "https://maps.wakegov.com/arcgis/rest/services/Property/Parcels/MapServer/0/query"
-        w_params = {
-            "geometry": envelope,
-            "geometryType": "esriGeometryEnvelope",
-            "inSR": "4326",
-            "spatialRel": "esriSpatialRelIntersects",
-            "where": "HEATEDAREA > 500",
-            "outFields": "*",
-            "returnGeometry": "false",
-            "resultRecordCount": 150,
-            "f": "json"
-        }
-        w_resp = requests.get(wake_url, params=w_params, timeout=20)
-        w_resp.raise_for_status()
-        features = w_resp.json().get("features", [])
+        try:
+            wake_url = "https://services1.arcgis.com/a7CWfuGP5ZnLYE7I/arcgis/rest/services/Wake_Parcels_Public/FeatureServer/0/query"
+            w_params = {
+                "geometry": envelope,
+                "geometryType": "esriGeometryEnvelope",
+                "inSR": "4326",
+                "spatialRel": "esriSpatialRelIntersects",
+                "where": "HEATEDAREA > 500",
+                "outFields": "PIN_NUM,SITE_ADDRESS,HEATEDAREA,YEAR_BUILT,TOTSALPRICE,TOTAL_VALUE_ASSD,SALE_DATE,MAP_NAME",
+                "returnGeometry": "false",
+                "resultRecordCount": 150,
+                "f": "json"
+            }
+            w_resp = requests.get(wake_url, params=w_params, timeout=15)
+            if w_resp.status_code == 200 and "features" in w_resp.json():
+                for idx, feat in enumerate(w_resp.json().get("features", [])):
+                    a = feat.get("attributes") or {}
+                    site_addr = str(a.get("SITE_ADDRESS") or f"Wake Parcel {idx+1}").strip()
+                    heated = float(a.get("HEATEDAREA") or 0)
+                    yr_built = int(a.get("YEAR_BUILT") or 2000)
+                    subd = str(a.get("MAP_NAME") or "").strip()
 
-        for idx, feat in enumerate(features):
-            a = feat.get("attributes") or {}
-            site_addr = str(a.get("SITE_ADDRESS") or a.get("FULL_STREET_NAME") or f"Wake Parcel {idx+1}").strip()
-            heated = float(a.get("HEATEDAREA") or 0)
-            yr_built = int(a.get("YEAR_BUILT") or 2000)
-            subd = str(a.get("SUBDIVISION") or a.get("MAP_NAME") or "").strip()
+                    sale_price = float(a.get("TOTSALPRICE") or 0)
+                    if sale_price <= 35000:
+                        sale_price = float(a.get("TOTAL_VALUE_ASSD") or 0)
+                    if sale_price <= 35000 or heated <= 500:
+                        continue
 
-            sale_price = float(a.get("TOTSALPRICE") or 0)
-            if sale_price <= 35000:
-                sale_price = float(a.get("TOTAL_VALUE_ASSD") or 0)
-            if sale_price <= 35000 or heated <= 500:
-                continue
+                    raw_dt = a.get("SALE_DATE")
+                    if isinstance(raw_dt, (int, float)) and raw_dt > 0:
+                        clean_dt = pd.to_datetime(raw_dt, unit="ms", errors="coerce")
+                    else:
+                        clean_dt = pd.to_datetime(raw_dt, errors="coerce")
+                    if pd.isna(clean_dt):
+                        clean_dt = pd.to_datetime("today") - pd.Timedelta(days=120)
 
-            raw_dt = a.get("SALE_DATE") or a.get("DEED_DATE")
-            if isinstance(raw_dt, (int, float)) and raw_dt > 0:
-                clean_dt = pd.to_datetime(raw_dt, unit="ms", errors="coerce")
-            else:
-                clean_dt = pd.to_datetime(raw_dt, errors="coerce")
-            if pd.isna(clean_dt):
-                clean_dt = pd.to_datetime("today") - pd.Timedelta(days=120)
+                    if site_addr.lower().startswith(street_num + " "):
+                        subject_autofill["gla"] = int(heated)
+                        if 1800 < yr_built <= 2027:
+                            subject_autofill["year_built"] = yr_built
+                        if subd:
+                            subject_autofill["subdivision"] = subd
+                        continue
 
-            if site_addr.lower().startswith(street_num + " "):
-                subject_autofill["gla"] = int(heated)
-                if 1800 < yr_built <= 2027:
-                    subject_autofill["year_built"] = yr_built
-                if subd:
-                    subject_autofill["subdivision"] = subd
-                continue
+                    rows.append({
+                        "MLS #": str(a.get("PIN_NUM") or f"WAKE-{idx+1}"),
+                        "Address": site_addr,
+                        "Clean_Price": sale_price,
+                        "Clean_GLA": heated,
+                        "Clean_Bsmt_Fin": 0.0,
+                        "Clean_Year": yr_built if 1800 < yr_built <= 2027 else 2000,
+                        "Clean_Beds": 3,
+                        "Clean_FB": 2,
+                        "Clean_HB": 1,
+                        "Clean_Subdivision": subd,
+                        "Clean_Date": clean_dt,
+                        "Clean_Garage": 2.0,
+                    })
+        except Exception:
+            pass
 
-            rows.append({
-                "MLS #": str(a.get("PIN_NUM") or a.get("REID") or f"WAKE-{idx+1}"),
-                "Address": site_addr,
-                "Clean_Price": sale_price,
-                "Clean_GLA": heated,
-                "Clean_Bsmt_Fin": 0.0,
-                "Clean_Year": yr_built if 1800 < yr_built <= 2027 else 2000,
-                "Clean_Beds": 3,
-                "Clean_FB": 2,
-                "Clean_HB": 1,
-                "Clean_Subdivision": subd,
-                "Clean_Date": clean_dt,
-                "Clean_Garage": 2.0,
-            })
-
-    # 2. ALL OTHER 7 COUNTIES VIA NC ONEMAP STATEWIDE PARCELS
+    # 2. NC ONEMAP STATEWIDE PARCELS (Covers all 8 counties & acts as automatic fallback)
     if not rows:
         parcel_url = "https://services.nconemap.gov/secure/rest/services/NC1Map_Parcels/MapServer/0/query"
         p_params = {
@@ -292,7 +293,8 @@ def fetch_comps_from_nconemap(address: str, radius_miles: float) -> tuple[dict, 
                 clean_dt = pd.to_datetime("today") - pd.Timedelta(days=120)
 
             if site_addr.lower().startswith(street_num + " "):
-                subject_autofill["gla"] = int(est_gla)
+                if subject_autofill["gla"] == 0:
+                    subject_autofill["gla"] = int(est_gla)
                 continue
 
             rows.append({
@@ -311,6 +313,82 @@ def fetch_comps_from_nconemap(address: str, radius_miles: float) -> tuple[dict, 
             })
 
     return subject_autofill, pd.DataFrame(rows)
+
+# ==============================================================================
+# EMPIRICAL MARKET CONDITIONS (TIME TREND) EXTRACTOR
+# ==============================================================================
+def calculate_historical_market_trend(df: pd.DataFrame, val_date_str: str) -> dict:
+    """
+    Analyzes historical sales dates and Price/SF in the dataset to empirically extract
+    the monthly market appreciation/depreciation trend (% per month) via OLS regression.
+    """
+    val_dt = pd.to_datetime(val_date_str)
+    trend_df = df[(df['Clean_GLA'] > 500) & (df['Clean_Price'] > 20000) & (df['Clean_Date'].notnull())].copy()
+
+    # Focus on transactions within the last 18 months so legacy decades-old deeds don't distort current trend
+    trend_df['Months_Ago'] = (val_dt - trend_df['Clean_Date']).dt.days / 30.4375
+    recent_df = trend_df[(trend_df['Months_Ago'] >= 0) & (trend_df['Months_Ago'] <= 18)].copy()
+
+    if len(recent_df) < 5:
+        return {
+            "monthly_pct": 0.0,
+            "annual_pct": 0.0,
+            "sample_size": len(recent_df),
+            "span_days": 0,
+            "status": "Insufficient recent sales (<5) for time regression; defaulted to 0.00%/mo."
+        }
+
+    span_days = int((recent_df['Clean_Date'].max() - recent_df['Clean_Date'].min()).days)
+    if span_days < 45:
+        return {
+            "monthly_pct": 0.0,
+            "annual_pct": 0.0,
+            "sample_size": len(recent_df),
+            "span_days": span_days,
+            "status": f"Date span too narrow ({span_days} days); defaulted to 0.00%/mo."
+        }
+
+    recent_df['PPSF'] = recent_df['Clean_Price'] / recent_df['Clean_GLA']
+    # Trim extreme 5% tails to prevent tear-downs or luxury outliers from skewing the slope
+    q_low, q_high = recent_df['PPSF'].quantile([0.05, 0.95])
+    trimmed = recent_df[(recent_df['PPSF'] >= q_low) & (recent_df['PPSF'] <= q_high)].copy()
+    if len(trimmed) < 5:
+        trimmed = recent_df
+
+    try:
+        # Regress PPSF on Months_Ago: a negative slope on Months_Ago means older sales sold for LESS (appreciating market);
+        # a positive slope on Months_Ago means older sales sold for MORE (declining market).
+        X = sm.add_constant(trimmed['Months_Ago'], has_constant='add')
+        y = trimmed['PPSF']
+        model = sm.OLS(y, X).fit()
+        slope_per_month_ago = float(model.params.get('Months_Ago', 0.0))
+        median_ppsf = float(trimmed['PPSF'].median())
+
+        if median_ppsf > 0:
+            raw_monthly_pct = (-slope_per_month_ago / median_ppsf) * 100.0
+        else:
+            raw_monthly_pct = 0.0
+
+        # Clamp within realistic residential bounds (-0.75%/mo to +0.75%/mo)
+        monthly_pct = round(float(np.clip(raw_monthly_pct, -0.75, 0.75)), 2)
+        annual_pct = round(monthly_pct * 12.0, 1)
+        direction = "declining" if monthly_pct < -0.04 else ("appreciating" if monthly_pct > 0.04 else "stable")
+
+        return {
+            "monthly_pct": monthly_pct,
+            "annual_pct": annual_pct,
+            "sample_size": len(trimmed),
+            "span_days": span_days,
+            "status": f"Data-driven ({len(trimmed)} sales over {span_days} days): {direction} at {monthly_pct:+.2f}%/mo ({annual_pct:+.1f}%/yr)."
+        }
+    except Exception:
+        return {
+            "monthly_pct": 0.0,
+            "annual_pct": 0.0,
+            "sample_size": len(recent_df),
+            "span_days": span_days,
+            "status": "Trend regression fallback: 0.00%/mo."
+        }
 
 # ==============================================================================
 # HEDONIC REGRESSION & SENSITIVITY ENGINE
@@ -447,15 +525,18 @@ def calculate_grid_adjustments(comps_df: pd.DataFrame, subject: dict, reg_params
         price = row['Clean_Price']
         comp_gla = row['Clean_GLA']
 
+        # 1. Data-Driven Market Conditions (Time) Adjustment
         if pd.notnull(row['Clean_Date']) and monthly_trend != 0.0:
             months_elapsed = max((val_dt - row['Clean_Date']).days / 30.4375, 0.0)
             time_adj = round(price * monthly_trend * months_elapsed, 0)
         else:
             time_adj = 0.0
 
+        # 2. ANSI Z765 Living Area Deadband (+/- 100 SF receives $0)
         gla_diff = subject['gla'] - comp_gla
         gla_adj = 0.0 if abs(gla_diff) <= deadband else round(gla_diff * gla_rate, 0)
 
+        # 3. Dynamic Room / Bath Contributory Utility Analysis
         fb_diff = subject['baths_full'] - row['Clean_FB']
         hb_diff = subject['baths_half'] - row['Clean_HB']
         raw_fb_rate = reg_params.get('fb_adj', 7500.0)
@@ -471,13 +552,16 @@ def calculate_grid_adjustments(comps_df: pd.DataFrame, subject: dict, reg_params
             room_adj = 0.0
             room_logic_note = "Equivalent functional bath utility."
 
+        # 4. Garage Adjustments ($10,000 per bay)
         gar_diff = subject['garage_bays'] - row['Clean_Garage']
         gar_adj = round(gar_diff * 10000.0, 0)
 
+        # 5. Below-Grade Finished Basement Net Difference ($50/SF)
         comp_bsmt = row.get('Clean_Bsmt_Fin', 0.0)
         bsmt_diff = subject['bsmt_fin'] - comp_bsmt
         bsmt_adj = round(bsmt_diff * 50.0, 0)
 
+        # 6. Age / Condition / Amenities Combined Physical Feature Adjustment
         yr_diff = subject['year_built'] - row.get('Clean_Year', subject['year_built'])
         age_adj = round(np.clip(yr_diff * 350.0, -12000.0, 12000.0), 0) if abs(yr_diff) >= 5 else 0.0
         other_adj = round(cond_adj_val + amenity_adj_val + age_adj, 0)
@@ -516,7 +600,7 @@ def calculate_grid_adjustments(comps_df: pd.DataFrame, subject: dict, reg_params
 # ==============================================================================
 # GROQ NARRATIVE GENERATOR (USPAP AO-18 COMPLIANT MARKET BRIEF)
 # ==============================================================================
-def generate_narrative_groq(api_key: str, subject: dict, reg_params: dict, grid_df: pd.DataFrame) -> str:
+def generate_narrative_groq(api_key: str, subject: dict, reg_params: dict, grid_df: pd.DataFrame, trend_info: dict) -> str:
     min_ind = int(grid_df['indicated'].min())
     max_ind = int(grid_df['indicated'].max())
     midpoint = int((min_ind + max_ind) / 2)
@@ -536,17 +620,19 @@ def generate_narrative_groq(api_key: str, subject: dict, reg_params: dict, grid_
         thesis_sentence = (
             f"For executed contract review on {subject['address']} in {subd_label}, the sales comparison grid establishes "
             f"an adjusted value range of ${min_ind:,.0f} to ${max_ind:,.0f} (midpoint ${midpoint:,.0f}) against a statistical "
-            f"hedonic benchmark of ${benchmark:,.0f}. Contracts ratified near or below the corridor midpoint are well-supported "
-            f"by closed neighborhood comparables, whereas contract prices approaching ${max_ind:,.0f} require strong documentary "
-            f"support for condition, upgrades, and net seller concessions."
+            f"hedonic benchmark of ${benchmark:,.0f}, reflecting an empirically derived market trend of {trend_info['monthly_pct']:+.2f}%/month "
+            f"({trend_info['annual_pct']:+.1f}%/year) across {trend_info['sample_size']} historical transactions. Contracts ratified near or below "
+            f"the corridor midpoint are well-supported by closed neighborhood comparables, whereas contract prices approaching ${max_ind:,.0f} "
+            f"require strong documentary support for condition, upgrades, and net seller concessions."
         )
     else:
         thesis_sentence = (
             f"The pre-listing market analysis for {subject['address']} in {subd_label} establishes an indicated price range "
             f"of ${min_ind:,.0f} to ${max_ind:,.0f}, yielding a supported corridor midpoint of ${midpoint:,.0f} against a statistical "
-            f"hedonic benchmark of ${benchmark:,.0f}. Positioning list price near the midpoint aligns with current {subject['county']} County "
-            f"buyer absorption, whereas pricing toward the upper limit (${max_ind:,.0f}) increases days-on-market and lender appraisal-gap risk "
-            f"for a {subject['beds']}-bedroom, {subj_bath_str} residence."
+            f"hedonic benchmark of ${benchmark:,.0f}. Historical sales regression across {trend_info['sample_size']} transactions indicates a "
+            f"market velocity of {trend_info['monthly_pct']:+.2f}%/month ({trend_info['annual_pct']:+.1f}%/year). Positioning list price near the midpoint "
+            f"aligns with current {subject['county']} County buyer absorption, whereas pricing toward the upper limit (${max_ind:,.0f}) increases "
+            f"days-on-market and lender appraisal-gap risk for a {subject['beds']}-bedroom, {subj_bath_str} residence."
         )
 
     fallback_narrative = f"""
@@ -599,7 +685,8 @@ def generate_narrative_groq(api_key: str, subject: dict, reg_params: dict, grid_
         prompt = f"""
 DELIVERABLE MODE: {val_mode}
 SUBJECT PROPERTY: {subject['address']} ({subject['county']} County, NC | {subd_label}) | Built {subject['year_built']} | Condition: {subject['condition']} | GLA: {subject['gla']:,} SF | {subject['beds']}b/{subj_bath_str} | Bsmt Fin: {subject['bsmt_fin']:,} SF
-Hedonic Benchmark: ${benchmark:,.0f} | Indicated Range: ${min_ind:,.0f} to ${max_ind:,.0f} (Midpoint: ${midpoint:,.0f}) | Extracted GLA Rate: ${gla_rate}/SF | Monthly Market Trend: {subject.get('monthly_trend_pct', 0.0)}%
+Hedonic Benchmark: ${benchmark:,.0f} | Indicated Range: ${min_ind:,.0f} to ${max_ind:,.0f} (Midpoint: ${midpoint:,.0f}) | Extracted GLA Rate: ${gla_rate}/SF
+Empirically Extracted Market Trend: {trend_info['monthly_pct']:+.2f}%/month ({trend_info['annual_pct']:+.1f}%/year across {trend_info['sample_size']} historical sales)
 
 COMPARABLES GRID:
 {comp_lines}
@@ -610,7 +697,7 @@ BRACKETING REFERENCES:
 
 Write an executive market pricing & defense brief formatted strictly as TWO HTML paragraphs (<p><b>Title:</b> Text</p>):
 
-1. <p><b>Executive Pricing Strategy & Market Range Thesis:</b> Tailor this paragraph specifically to "{val_mode}". Reconcile the indicated range (${min_ind:,.0f}-${max_ind:,.0f}), midpoint (${midpoint:,.0f}), and hedonic benchmark (${benchmark:,.0f}) in the context of {subject['county']} County market conditions.</p>
+1. <p><b>Executive Pricing Strategy & Market Range Thesis:</b> Tailor this paragraph specifically to "{val_mode}". Reconcile the indicated range (${min_ind:,.0f}-${max_ind:,.0f}), midpoint (${midpoint:,.0f}), and hedonic benchmark (${benchmark:,.0f}), noting the data-derived {trend_info['monthly_pct']:+.2f}%/month market trend in {subject['county']} County.</p>
 
 2. <p><b>ANSI Z765 & Functional Utility Bracketing Analysis:</b> Reference {min_gla_row['address']} ({int(min_gla_row['gla']):,} SF) and {max_gla_row['address']} ({int(max_gla_row['gla']):,} SF) bracketing the subject's {subject['gla']:,} SF. Explain how the ${gla_rate}/SF GLA adjustment captures overall living area utility without double-counting bedroom/bath differences.</p>
 
@@ -639,7 +726,7 @@ CRITICAL COMPLIANCE & ACCURACY RULES:
 # ==============================================================================
 # AUDIT-GRADE PDF EXPORT
 # ==============================================================================
-def build_pdf_report(subject: dict, reg_params: dict, grid_df: pd.DataFrame, narrative_text: str) -> BytesIO:
+def build_pdf_report(subject: dict, reg_params: dict, grid_df: pd.DataFrame, narrative_text: str, trend_info: dict) -> BytesIO:
     clean_narrative = sanitize_for_pdf(narrative_text)
     clean_narrative = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', clean_narrative)
 
@@ -720,7 +807,7 @@ def build_pdf_report(subject: dict, reg_params: dict, grid_df: pd.DataFrame, nar
                 <td class="kpi-box"><div class="kpi-lbl">Statistical Benchmark</div><div class="kpi-val">${reg_params['benchmark']:,.0f}</div></td>
                 <td class="kpi-box"><div class="kpi-lbl">Indicated Midpoint</div><div class="kpi-val">${midpoint:,.0f}</div></td>
                 <td class="kpi-box"><div class="kpi-lbl">Indicated Value Range</div><div class="kpi-val">${min_val:,.0f} - ${max_val:,.0f}</div></td>
-                <td class="kpi-box"><div class="kpi-lbl">Model GLA Rate</div><div class="kpi-val">${reg_params['gla_rate']}/SF</div></td>
+                <td class="kpi-box"><div class="kpi-lbl">Extracted Market Trend</div><div class="kpi-val">{trend_info['monthly_pct']:+.2f}% / mo</div></td>
             </tr>
         </table>
 
@@ -751,7 +838,7 @@ def build_pdf_report(subject: dict, reg_params: dict, grid_df: pd.DataFrame, nar
             </tbody>
         </table>
         <div style="font-size: 6.5pt; color: #64748B; margin-top: 4px;">
-            *Model Parameters: Living area variances within +/- 100 SF receive $0 per ANSI Z765 standards. Monthly market condition trend applied at {subject.get('monthly_trend_pct', 0.0):+.2f}%/mo. Garage valued at $10,000/bay; net finished basement differential at $50/SF.
+            *Model Parameters: Living area variances within +/- 100 SF receive $0 per ANSI Z765 standards. Extracted GLA Rate: ${reg_params['gla_rate']}/SF. Market condition trend empirically derived from historical sales ({trend_info['monthly_pct']:+.2f}%/mo, n={trend_info['sample_size']}). Garage valued at $10,000/bay; net finished basement differential at $50/SF.
         </div>
 
         <div class="cta-box">
@@ -778,7 +865,7 @@ if "autofill_subject" not in st.session_state:
 # SIDEBAR CONTROLS
 # ==============================================================================
 with st.sidebar:
-    st.header("1. County & Market Parameters")
+    st.header("1. County & Search Scope")
     selected_county = st.selectbox("NC County:", list(NC_COUNTY_CONFIG.keys()), index=0)
     county_meta = NC_COUNTY_CONFIG[selected_county]
     st.caption(f"Market Profile: {county_meta['tier']} (Default Radius: {county_meta['default_radius']} mi)")
@@ -790,23 +877,30 @@ with st.sidebar:
         value=float(county_meta["default_radius"]),
         step=0.25
     )
-    monthly_trend_pct = st.slider(
-        "Monthly Market Condition Trend (%):",
-        min_value=-1.00,
-        max_value=1.00,
-        value=float(county_meta["monthly_trend_pct"]),
-        step=0.05,
-        help="Negative applies downward time adjustments to older closed sales."
-    )
 
     st.header("2. Deliverable Strategy Mode")
     val_mode = st.radio("Brief Purpose:", ["Pre-Listing / CMA Strategy", "Executed Contract Defense"])
     val_date = st.date_input("Effective Analysis Date:", value=date.today())
 
-    st.header("3. Comparable Selection Mode")
+    st.header("3. Market Conditions (Time Trend)")
+    trend_mode = st.radio(
+        "Time Adjustment Method:",
+        ["Auto-Detect from Historical Data", "Manual Override"]
+    )
+    manual_trend_override = 0.0
+    if trend_mode == "Manual Override":
+        manual_trend_override = st.slider(
+            "Manual Monthly Trend (%):",
+            min_value=-0.75,
+            max_value=0.75,
+            value=0.0,
+            step=0.05
+        )
+
+    st.header("4. Comparable Selection Mode")
     comp_mode = st.radio("Selection Strategy:", ["Algorithmic (Two-Sided Bracketing)", "Manual Override (Pick Specific Comps)"])
 
-    st.header("4. Narrative Engine")
+    st.header("5. Narrative Engine")
     groq_api_key = os.getenv("GROQ_API_KEY", st.secrets.get("GROQ_API_KEY", ""))
     if groq_api_key:
         st.success("AI Narrative Engine Connected")
@@ -944,38 +1038,52 @@ with am_cols[4]:
 with am_cols[5]:
     has_pool = st.checkbox("Pool", value=False)
 
-subject_data = {
-    "address": subj_address.strip(),
-    "county": af.get("county", selected_county),
-    "subdivision": subj_subdivision.strip(),
-    "year_built": subj_year,
-    "gla": subj_gla,
-    "beds": subj_beds,
-    "baths_full": subj_fb,
-    "baths_half": subj_hb,
-    "garage_bays": subj_garage,
-    "condition": subj_condition,
-    "fireplaces": subj_fireplaces,
-    "bsmt_fin": subj_bsmt_fin,
-    "val_date": str(val_date),
-    "val_mode": val_mode,
-    "monthly_trend_pct": monthly_trend_pct,
-    "amenities": {
-        "Front Porch": has_front_porch,
-        "Screen Porch": has_screen_porch,
-        "Deck": has_deck,
-        "Patio": has_patio,
-        "Fenced Yard": has_fence,
-        "Pool": has_pool
-    }
-}
-
 # ==============================================================================
 # EXECUTION WORKFLOW
 # ==============================================================================
 active_df = st.session_state.get("active_comps_df")
 
 if active_df is not None and not active_df.empty:
+    # Run empirical market conditions trend analysis on the loaded historical sales
+    if trend_mode == "Auto-Detect from Historical Data":
+        trend_info = calculate_historical_market_trend(active_df, str(val_date))
+    else:
+        trend_info = {
+            "monthly_pct": manual_trend_override,
+            "annual_pct": round(manual_trend_override * 12.0, 1),
+            "sample_size": len(active_df),
+            "span_days": 0,
+            "status": f"Manual override applied: {manual_trend_override:+.2f}%/mo ({manual_trend_override*12:+.1f}%/yr)."
+        }
+
+    st.info(f"📈 **Market Conditions Analysis:** {trend_info['status']}")
+
+    subject_data = {
+        "address": subj_address.strip(),
+        "county": af.get("county", selected_county),
+        "subdivision": subj_subdivision.strip(),
+        "year_built": subj_year,
+        "gla": subj_gla,
+        "beds": subj_beds,
+        "baths_full": subj_fb,
+        "baths_half": subj_hb,
+        "garage_bays": subj_garage,
+        "condition": subj_condition,
+        "fireplaces": subj_fireplaces,
+        "bsmt_fin": subj_bsmt_fin,
+        "val_date": str(val_date),
+        "val_mode": val_mode,
+        "monthly_trend_pct": trend_info["monthly_pct"],
+        "amenities": {
+            "Front Porch": has_front_porch,
+            "Screen Porch": has_screen_porch,
+            "Deck": has_deck,
+            "Patio": has_patio,
+            "Fenced Yard": has_fence,
+            "Pool": has_pool
+        }
+    }
+
     manual_ids = []
     if comp_mode == "Manual Override (Pick Specific Comps)":
         mls_options = active_df['MLS #'].tolist()
@@ -998,7 +1106,7 @@ if active_df is not None and not active_df.empty:
                 grid_df = calculate_grid_adjustments(comps_df, subject_data, reg_params)
 
                 with st.spinner("Compiling market narrative..."):
-                    narrative = generate_narrative_groq(groq_api_key, subject_data, reg_params, grid_df)
+                    narrative = generate_narrative_groq(groq_api_key, subject_data, reg_params, grid_df, trend_info)
 
                 min_ind = int(grid_df['indicated'].min())
                 max_ind = int(grid_df['indicated'].max())
@@ -1008,7 +1116,7 @@ if active_df is not None and not active_df.empty:
                 k1.metric("Hedonic Benchmark", f"${reg_params['benchmark']:,.0f}")
                 k2.metric("Indicated Midpoint", f"${mid_ind:,.0f}")
                 k3.metric("Indicated Range", f"${min_ind:,.0f} - ${max_ind:,.0f}")
-                k4.metric("Extracted GLA Rate", f"${reg_params['gla_rate']}/SF")
+                k4.metric("Extracted Market Trend", f"{trend_info['monthly_pct']:+.2f}% / mo")
 
                 st.markdown("### Comparable Sales Adjustment Grid")
                 st.dataframe(
@@ -1019,7 +1127,7 @@ if active_df is not None and not active_df.empty:
                 with st.expander("Preview Executive Market Narrative", expanded=True):
                     st.write(narrative, unsafe_allow_html=True)
 
-                pdf_bytes = build_pdf_report(subject_data, reg_params, grid_df, narrative)
+                pdf_bytes = build_pdf_report(subject_data, reg_params, grid_df, narrative, trend_info)
                 clean_filename = f"Market_Brief_{re.sub(r'[^a-zA-Z0-9]', '_', subj_address)}.pdf"
                 st.download_button(
                     label="📥 Download Market Range & Defense Brief (PDF)",
