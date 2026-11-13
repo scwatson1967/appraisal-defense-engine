@@ -1,18 +1,20 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import statsmodels.api as sm
+import os
 import re
 from io import BytesIO
 from datetime import date
+import requests
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+import streamlit as st
 from xhtml2pdf import pisa
 from groq import Groq
 
 # ==============================================================================
-# PAGE CONFIGURATION
+# PAGE CONFIGURATION & STYLING
 # ==============================================================================
 st.set_page_config(
-    page_title="Listing Defense Brief & Pricing Engine",
+    page_title="8-County NC Valuation & Listing Defense Engine",
     page_icon="🏡",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -24,6 +26,20 @@ st.markdown("""
     .sub-header { font-size: 13px; color: #4B5563; margin-bottom: 18px; }
 </style>
 """, unsafe_allow_html=True)
+
+# ==============================================================================
+# 8-COUNTY NC ADAPTIVE RADIUS CONFIGURATION
+# ==============================================================================
+NC_COUNTY_CONFIG = {
+    "Wake": {"default_radius": 0.75, "tier": "Urban/Suburban Core", "monthly_trend_pct": -0.20},
+    "Durham": {"default_radius": 0.75, "tier": "Urban/Suburban Core", "monthly_trend_pct": -0.15},
+    "Cumberland": {"default_radius": 1.00, "tier": "Metro Military Core", "monthly_trend_pct": 0.00},
+    "Orange": {"default_radius": 1.25, "tier": "Mixed Suburban/Rural", "monthly_trend_pct": 0.00},
+    "Johnston": {"default_radius": 1.50, "tier": "Suburban/Exurban Growth", "monthly_trend_pct": -0.15},
+    "Chatham": {"default_radius": 2.25, "tier": "Suburban/Rural Acreage", "monthly_trend_pct": 0.00},
+    "Franklin": {"default_radius": 2.50, "tier": "Rural/Exurban", "monthly_trend_pct": -0.10},
+    "Granville": {"default_radius": 2.50, "tier": "Rural/Exurban", "monthly_trend_pct": -0.10},
+}
 
 # ==============================================================================
 # TEXT SANITIZER (PREVENTS BLACK GLYPH BOXES IN REPORTLAB / HELVETICA)
@@ -41,15 +57,16 @@ def sanitize_for_pdf(text: str) -> str:
         "×": "x",
         r"\le": "<=",
         r"\ge": ">=",
-        "–": "-",      # en-dash
-        "—": "-",      # em-dash
+        "–": "-",
+        "—": "-",
         "“": '"',
         "”": '"',
         "’": "'",
         "‘": "'",
         "…": "...",
+        "•": "|",
         "\u00a0": " ",
-        "\u200b": "",  # zero-width space
+        "\u200b": "",
     }
     for old, new in replacements.items():
         text = text.replace(old, new)
@@ -60,9 +77,9 @@ def sanitize_for_pdf(text: str) -> str:
     return text.strip()
 
 # ==============================================================================
-# DATA INGESTION & NORMALIZATION
+# DATA INGESTION & NORMALIZATION (CSV, API, OR MANUAL)
 # ==============================================================================
-def clean_currency(val):
+def clean_currency(val) -> float:
     if pd.isna(val):
         return 0.0
     if isinstance(val, (int, float)):
@@ -70,11 +87,18 @@ def clean_currency(val):
     val_str = re.sub(r'[^\d.]', '', str(val))
     return float(val_str) if val_str else 0.0
 
-def load_and_clean_data(file):
+def load_and_clean_csv(file) -> pd.DataFrame:
     df = pd.read_csv(file)
-    
+
     if 'MLS #' in df.columns:
         df['MLS #'] = df['MLS #'].astype(str).str.strip()
+    else:
+        df['MLS #'] = [f"MLS-{i+1}" for i in range(len(df))]
+
+    if 'Address' not in df.columns:
+        addr_cols = ['Street Address', 'Full Address', 'Property Address']
+        found_addr = next((c for c in addr_cols if c in df.columns), None)
+        df['Address'] = df[found_addr].astype(str) if found_addr else "Unknown Address"
 
     price_cols = ['Close Price', 'Sold Price', 'Purchase Price', 'Price']
     found_price = next((c for c in price_cols if c in df.columns), None)
@@ -85,17 +109,25 @@ def load_and_clean_data(file):
     found_gla = next((c for c in gla_cols if c in df.columns), None)
     df['Clean_GLA'] = df[found_gla].apply(clean_currency) if found_gla else 0.0
 
+    bsmt_cols = ['Below Grade Finished Area', 'Basement Finished SqFt', 'Finished Basement']
+    found_bsmt = next((c for c in bsmt_cols if c in df.columns), None)
+    df['Clean_Bsmt_Fin'] = df[found_bsmt].apply(clean_currency) if found_bsmt else 0.0
+
+    yr_cols = ['Year Built', 'Yr Built', 'Built']
+    found_yr = next((c for c in yr_cols if c in df.columns), None)
+    df['Clean_Year'] = pd.to_numeric(df[found_yr], errors='coerce').fillna(2000).astype(int) if found_yr else 2000
+
     bed_cols = ['Bedrooms Total', 'Bedrooms', 'Beds Total']
     found_bed = next((c for c in bed_cols if c in df.columns), None)
-    df['Clean_Beds'] = df[found_bed].fillna(3).astype(int) if found_bed else 3
+    df['Clean_Beds'] = pd.to_numeric(df[found_bed], errors='coerce').fillna(3).astype(int) if found_bed else 3
 
     fb_cols = ['Bathrooms Full', 'Baths Full', 'Full Baths']
     found_fb = next((c for c in fb_cols if c in df.columns), None)
-    df['Clean_FB'] = df[found_fb].fillna(2).astype(int) if found_fb else 2
+    df['Clean_FB'] = pd.to_numeric(df[found_fb], errors='coerce').fillna(2).astype(int) if found_fb else 2
 
     hb_cols = ['Bathrooms Half', 'Baths Half', 'Half Baths']
     found_hb = next((c for c in hb_cols if c in df.columns), None)
-    df['Clean_HB'] = df[found_hb].fillna(0).astype(int) if found_hb else 0
+    df['Clean_HB'] = pd.to_numeric(df[found_hb], errors='coerce').fillna(0).astype(int) if found_hb else 0
 
     subd_cols = ['Subdivision', 'Subdivision-Free Text', 'Legal Subdivision']
     found_subd = next((c for c in subd_cols if c in df.columns), None)
@@ -114,38 +146,101 @@ def load_and_clean_data(file):
 
     return df
 
+def fetch_comps_from_rentcast(address: str, api_key: str, radius_miles: float, days_old: int = 365) -> tuple[dict, pd.DataFrame]:
+    """
+    Queries RentCast Public Records / AVM endpoint for subject attributes and nearby closed sales
+    across Wake, Durham, Orange, Johnston, Cumberland, Franklin, Chatham, and Granville counties.
+    """
+    headers = {"X-Api-Key": api_key.strip(), "accept": "application/json"}
+    url = "https://api.rentcast.io/v1/avm/value"
+    params = {
+        "address": address.strip(),
+        "compCount": 25,
+        "maxRadius": float(radius_miles),
+        "daysOld": int(days_old),
+        "lookupSubjectAttributes": "true"
+    }
+
+    resp = requests.get(url, headers=headers, params=params, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+
+    subj_raw = data.get("subjectProperty") or {}
+    raw_baths = float(subj_raw.get("bathrooms") or 2.0)
+
+    detected_county = str(subj_raw.get("county") or "Wake").replace(" County", "").strip()
+    if detected_county not in NC_COUNTY_CONFIG:
+        detected_county = "Wake"
+
+    subject_autofill = {
+        "address": subj_raw.get("formattedAddress") or address,
+        "county": detected_county,
+        "subdivision": str(subj_raw.get("subdivision") or "").strip(),
+        "year_built": int(subj_raw.get("yearBuilt") or 2000),
+        "gla": int(subj_raw.get("squareFootage") or 2000),
+        "beds": int(subj_raw.get("bedrooms") or 3),
+        "baths_full": int(raw_baths),
+        "baths_half": 1 if (raw_baths % 1) >= 0.5 else 0,
+    }
+
+    rows = []
+    for idx, c in enumerate(data.get("comparables") or []):
+        price = float(c.get("price") or 0)
+        gla = float(c.get("squareFootage") or 0)
+        if price <= 20000 or gla <= 500:
+            continue
+        baths = float(c.get("bathrooms") or 2.0)
+        sale_dt = c.get("removedDate") or c.get("lastSeenDate") or c.get("listedDate")
+        rows.append({
+            "MLS #": f"PUB-{idx+1}",
+            "Address": c.get("formattedAddress", "Unknown Address"),
+            "Clean_Price": price,
+            "Clean_GLA": gla,
+            "Clean_Bsmt_Fin": 0.0,
+            "Clean_Year": int(c.get("yearBuilt") or 2000),
+            "Clean_Beds": int(c.get("bedrooms") or 3),
+            "Clean_FB": int(baths),
+            "Clean_HB": 1 if (baths % 1) >= 0.5 else 0,
+            "Clean_Subdivision": str(c.get("subdivision") or "").strip(),
+            "Clean_Date": pd.to_datetime(sale_dt, errors="coerce"),
+            "Clean_Garage": float(c.get("garageSpaces") or 0.0),
+        })
+
+    return subject_autofill, pd.DataFrame(rows)
+
 # ==============================================================================
 # HEDONIC REGRESSION & SENSITIVITY ENGINE
 # ==============================================================================
-def run_regression_analysis(df, subject):
+def run_regression_analysis(df: pd.DataFrame, subject: dict) -> dict:
     reg_df = df[df['Clean_GLA'] > 500].copy()
     if len(reg_df) < 5:
+        median_ppsf = (reg_df['Clean_Price'] / reg_df['Clean_GLA']).median() if not reg_df.empty else 185.0
         return {
             "r2": 0.50,
-            "gla_rate": 65.0,
+            "gla_rate": round(float(np.clip(median_ppsf * 0.40, 45.0, 165.0)), 2),
             "fb_adj": 7500.0,
             "hb_adj": 3500.0,
             "bed_adj": 0.0,
             "garage_rate": 10000.0,
-            "benchmark": float(subject['gla'] * 180)
+            "benchmark": round(float(subject['gla'] * median_ppsf), 0)
         }
 
     X = reg_df[['Clean_GLA', 'Clean_FB', 'Clean_HB']]
-    X = sm.add_constant(X)
+    X = sm.add_constant(X, has_constant='add')
     y = reg_df['Clean_Price']
 
     try:
         model = sm.OLS(y, X).fit()
-        gla_coef = model.params.get('Clean_GLA', 45.0)
-        fb_coef = model.params.get('Clean_FB', 5000.0)
-        hb_coef = model.params.get('Clean_HB', 2500.0)
-        r2 = model.rsquared
+        gla_coef = model.params.get('Clean_GLA', 55.0)
+        fb_coef = model.params.get('Clean_FB', 6000.0)
+        hb_coef = model.params.get('Clean_HB', 3000.0)
+        r2 = float(model.rsquared)
 
         gla_rate = round(float(np.clip(gla_coef, 35.0, 185.0)), 2)
         fb_adj = round(float(np.clip(fb_coef, 3000.0, 25000.0)), 0)
         hb_adj = round(float(np.clip(hb_coef, 1500.0, 12500.0)), 0)
 
-        subj_pred = model.predict([1, subject['gla'], subject['baths_full'], subject['baths_half']])[0]
+        subj_pred = model.predict([1.0, subject['gla'], subject['baths_full'], subject['baths_half']])[0]
         benchmark = round(float(subj_pred), 0)
     except Exception:
         r2 = 0.40
@@ -165,9 +260,9 @@ def run_regression_analysis(df, subject):
     }
 
 # ==============================================================================
-# COMPARABLE SELECTION (SUBDIVISION PRIORITY + ANSI BRACKETING)
+# COMPARABLE SELECTION (EXACT SUBDIVISION PRIORITY + TWO-SIDED BRACKETING)
 # ==============================================================================
-def select_comparables_with_subdivision(df, subject, reg_params, mode="algorithmic", manual_mls_ids=None):
+def select_comparables_with_subdivision(df: pd.DataFrame, subject: dict, reg_params: dict, mode: str = "algorithmic", manual_mls_ids=None) -> pd.DataFrame:
     df_pool = df.copy()
     subj_gla = subject['gla']
     subj_subd = str(subject.get('subdivision', '')).strip().lower()
@@ -176,14 +271,21 @@ def select_comparables_with_subdivision(df, subject, reg_params, mode="algorithm
     if mode == "manual" and manual_mls_ids:
         return df_pool[df_pool['MLS #'].astype(str).isin([str(x) for x in manual_mls_ids])].copy()
 
-    # Score comps based on GLA proximity, recency, and subdivision priority
     scores = []
     for _, row in df_pool.iterrows():
         gla_diff = abs(row['Clean_GLA'] - subj_gla)
         row_subd = str(row['Clean_Subdivision']).strip().lower()
-        subd_bonus = -400.0 if (subj_subd and subj_subd in row_subd) else 0.0
-        days_diff = (pd.to_datetime('today') - row['Clean_Date']).days if pd.notnull(row['Clean_Date']) else 90
-        recency_penalty = min(days_diff * 0.1, 50.0)
+
+        # Exact subdivision match gets priority; partial word-boundary match gets secondary credit
+        if subj_subd and row_subd == subj_subd:
+            subd_bonus = -500.0
+        elif subj_subd and re.search(rf'\b{re.escape(subj_subd)}\b', row_subd):
+            subd_bonus = -300.0
+        else:
+            subd_bonus = 0.0
+
+        days_diff = (pd.to_datetime(subject['val_date']) - row['Clean_Date']).days if pd.notnull(row['Clean_Date']) else 90
+        recency_penalty = min(max(days_diff, 0) * 0.15, 60.0)
         score = gla_diff + subd_bonus + recency_penalty
         scores.append(score)
 
@@ -193,26 +295,25 @@ def select_comparables_with_subdivision(df, subject, reg_params, mode="algorithm
     selected_mls = []
 
     # 1. Prioritize closest internal subdivision sales
-    subd_matches = df_pool[df_pool['Clean_Subdivision'].str.lower().str.contains(subj_subd, na=False)] if subj_subd else pd.DataFrame()
-    for _, r in subd_matches.head(2).iterrows():
-        selected_mls.append(r['MLS #'])
+    if subj_subd:
+        subd_matches = df_pool[df_pool['Clean_Subdivision'].str.lower().str.strip() == subj_subd]
+        for _, r in subd_matches.head(2).iterrows():
+            selected_mls.append(r['MLS #'])
 
-    # 2. ENFORCE TWO-SIDED UNADJUSTED SALE PRICE BRACKETING
-    # Ensure at least one comp sold at or below the benchmark
+    # 2. Enforce two-sided unadjusted sale price bracketing around benchmark
     pool_lower_price = df_pool[df_pool['Clean_Price'] <= benchmark]
     if not pool_lower_price.empty:
         lower_comp = pool_lower_price[~pool_lower_price['MLS #'].isin(selected_mls)].head(1)
         if not lower_comp.empty:
             selected_mls.append(lower_comp.iloc[0]['MLS #'])
 
-    # Ensure at least one comp sold at or above the benchmark
     pool_upper_price = df_pool[df_pool['Clean_Price'] >= benchmark]
     if not pool_upper_price.empty:
         upper_comp = pool_upper_price[~pool_upper_price['MLS #'].isin(selected_mls)].head(1)
         if not upper_comp.empty:
             selected_mls.append(upper_comp.iloc[0]['MLS #'])
 
-    # 3. Fill remaining slots up to 4 total comparables based on overall suitability score
+    # 3. Fill remaining slots up to 4 comparables
     remaining = df_pool[~df_pool['MLS #'].isin(selected_mls)]
     for _, r in remaining.iterrows():
         if len(selected_mls) >= 4:
@@ -224,65 +325,75 @@ def select_comparables_with_subdivision(df, subject, reg_params, mode="algorithm
 # ==============================================================================
 # SALES COMPARISON GRID ADJUSTMENTS
 # ==============================================================================
-def calculate_grid_adjustments(comps_df, subject, reg_params):
+def calculate_grid_adjustments(comps_df: pd.DataFrame, subject: dict, reg_params: dict) -> pd.DataFrame:
     grid_rows = []
     gla_rate = reg_params['gla_rate']
     deadband = 100.0
+    val_dt = pd.to_datetime(subject['val_date'])
+    monthly_trend = subject.get('monthly_trend_pct', 0.0) / 100.0
+
+    # Condition offset relative to "Average" baseline
+    cond_map = {"Excellent": 15000.0, "Good": 7500.0, "Average": 0.0, "Fair": -12500.0}
+    cond_adj_val = cond_map.get(subject.get('condition', 'Average'), 0.0)
+
+    # Amenity contributory value index relative to typical neighborhood baseline
+    am = subject.get('amenities', {})
+    amenity_adj_val = (
+        (3500.0 if am.get("Screen Porch") else 0.0) +
+        (2500.0 if am.get("Fenced Yard") else 0.0) +
+        (12000.0 if am.get("Pool") else 0.0) +
+        (max(subject.get('fireplaces', 1) - 1, 0) * 2000.0)
+    )
 
     for _, row in comps_df.iterrows():
         price = row['Clean_Price']
         comp_gla = row['Clean_GLA']
-        
-        # 1. ANSI Z765 Living Area Deadband (+/- 100 SF receives $0)
+
+        # 1. Market Conditions (Time) Adjustment
+        if pd.notnull(row['Clean_Date']) and monthly_trend != 0.0:
+            months_elapsed = max((val_dt - row['Clean_Date']).days / 30.4375, 0.0)
+            time_adj = round(price * monthly_trend * months_elapsed, 0)
+        else:
+            time_adj = 0.0
+
+        time_adjusted_price = price + time_adj
+
+        # 2. ANSI Z765 Living Area Deadband (+/- 100 SF receives $0)
         gla_diff = subject['gla'] - comp_gla
         gla_adj = 0.0 if abs(gla_diff) <= deadband else round(gla_diff * gla_rate, 0)
 
-        # 2. Dynamic Room / Bath Contributory Utility Analysis
+        # 3. Dynamic Room / Bath Contributory Utility Analysis
         fb_diff = subject['baths_full'] - row['Clean_FB']
         hb_diff = subject['baths_half'] - row['Clean_HB']
-        bed_diff = subject['beds'] - row['Clean_Beds']
+        raw_fb_rate = reg_params.get('fb_adj', 7500.0)
+        raw_hb_rate = reg_params.get('hb_adj', 3500.0)
 
-        # Preliminary matched-pair baseline
-        raw_fb_rate = 7500.0
-        raw_hb_rate = 3500.0
-
-        # Dynamic Market Rules:
-        # Rule A: Comp has equal or superior utility (e.g. 4b/3ba vs 3b/2.1ba).
-        # Market reality: A buyer will NEVER pay a premium for fewer bathrooms.
-        # If raw regression produced an inverted positive adjustment, or if residual
-        # variance shows bedroom/bath count is absorbed by the physical GLA footprint,
-        # set to $0 to prevent irrational adjustments and double-dipping.
         if (fb_diff <= 0 and hb_diff >= 0) or (fb_diff < 0):
-            # Test if net utility justifies a downward adjustment or if GLA absorbed it
-            net_bath_utility = (fb_diff * raw_fb_rate) + (hb_diff * raw_hb_rate)
-            if net_bath_utility > 0:
-                # Math artifact (saying market pays more for less): strictly suppress to $0
-                room_adj = 0.0
-                room_logic_note = "Market logic: No premium for fewer baths; absorbed by GLA."
-            else:
-                # If market indicates GLA already adjusted -$19k to -$48k for the larger home,
-                # separate room count adjustment is $0 per paired sales sensitivity.
-                room_adj = 0.0
-                room_logic_note = "GLA adjustment absorbed functional room utility."
+            room_adj = 0.0
+            room_logic_note = "GLA adjustment absorbed functional room utility; no inverted bath premium."
         elif fb_diff > 0:
-            # Subject is physically superior in baths (e.g., Comp lacks a bathroom).
-            # Market indicates upward adjustment to comp is warranted.
-            room_adj = (fb_diff * raw_fb_rate) + (hb_diff * raw_hb_rate)
+            room_adj = round((fb_diff * raw_fb_rate) + (hb_diff * raw_hb_rate), 0)
             room_logic_note = f"Comp inferior by {fb_diff} full bath(s); adjusted upward."
         else:
             room_adj = 0.0
-            room_logic_note = "Equivalent functional utility."
+            room_logic_note = "Equivalent functional bath utility."
 
-        # 3. Site & Garage Adjustments ($10,000 per bay)
+        # 4. Garage Adjustments ($10,000 per bay)
         gar_diff = subject['garage_bays'] - row['Clean_Garage']
-        gar_adj = gar_diff * 10000.0
+        gar_adj = round(gar_diff * 10000.0, 0)
 
-        # 4. Below-Grade & Condition Adjustments
-        bsmt_adj = (subject['bsmt_fin'] * 50.0)
-        cond_adj = 0.0
+        # 5. Below-Grade Finished Basement Net Difference ($50/SF)
+        comp_bsmt = row.get('Clean_Bsmt_Fin', 0.0)
+        bsmt_diff = subject['bsmt_fin'] - comp_bsmt
+        bsmt_adj = round(bsmt_diff * 50.0, 0)
 
-        net_adj = gla_adj + room_adj + gar_adj + cond_adj + bsmt_adj
-        gross_adj = abs(gla_adj) + abs(room_adj) + abs(gar_adj) + abs(cond_adj) + abs(bsmt_adj)
+        # 6. Age / Condition / Amenities Combined Physical Feature Adjustment
+        yr_diff = subject['year_built'] - row.get('Clean_Year', subject['year_built'])
+        age_adj = round(np.clip(yr_diff * 350.0, -12000.0, 12000.0), 0) if abs(yr_diff) >= 5 else 0.0
+        other_adj = round(cond_adj_val + amenity_adj_val + age_adj, 0)
+
+        net_adj = time_adj + gla_adj + room_adj + gar_adj + bsmt_adj + other_adj
+        gross_adj = abs(time_adj) + abs(gla_adj) + abs(room_adj) + abs(gar_adj) + abs(bsmt_adj) + abs(other_adj)
         indicated = price + net_adj
 
         net_pct = round((net_adj / price) * 100, 1) if price > 0 else 0.0
@@ -296,11 +407,12 @@ def calculate_grid_adjustments(comps_df, subject, reg_params):
             "contract_date": row['Clean_Date'].strftime('%m/%d/%Y') if pd.notnull(row['Clean_Date']) else 'N/A',
             "gla": comp_gla,
             "rooms": f"{row['Clean_Beds']}b/{row['Clean_FB']}.{row['Clean_HB']}ba",
+            "time_adj": time_adj,
             "gla_adj": gla_adj,
             "room_adj": room_adj,
             "gar_adj": gar_adj,
             "bsmt_adj": bsmt_adj,
-            "cond_adj": cond_adj,
+            "other_adj": other_adj,
             "net_adj": net_adj,
             "gross_adj": gross_adj,
             "net_pct": net_pct,
@@ -312,45 +424,57 @@ def calculate_grid_adjustments(comps_df, subject, reg_params):
     return pd.DataFrame(grid_rows)
 
 # ==============================================================================
-# GROQ NARRATIVE GENERATOR
+# GROQ NARRATIVE GENERATOR (USPAP AO-18 COMPLIANT MARKET BRIEF)
 # ==============================================================================
-from groq import Groq
-
-def generate_narrative_groq(api_key, subject, reg_params, grid_df):
+def generate_narrative_groq(api_key: str, subject: dict, reg_params: dict, grid_df: pd.DataFrame) -> str:
     min_ind = int(grid_df['indicated'].min())
     max_ind = int(grid_df['indicated'].max())
     midpoint = int((min_ind + max_ind) / 2)
     benchmark = int(reg_params['benchmark'])
     gla_rate = reg_params['gla_rate']
-    
-    # Identify actual bracketing properties
+    val_mode = subject.get('val_mode', 'Pre-Listing / CMA Strategy')
+
     min_gla_row = grid_df.loc[grid_df['gla'].idxmin()]
     max_gla_row = grid_df.loc[grid_df['gla'].idxmax()]
     min_p_row = grid_df.loc[grid_df['price'].idxmin()]
     max_p_row = grid_df.loc[grid_df['price'].idxmax()]
 
-    # DETERMINISTIC AUDIT-GRADE NARRATIVE (Guarantees Page 1 is never blank)
+    subj_bath_str = f"{subject['baths_full']}.{subject['baths_half']}ba"
+    subd_label = subject['subdivision'] if subject['subdivision'] else f"{subject['county']} County submarket"
+
+    if val_mode == "Executed Contract Defense":
+        thesis_sentence = (
+            f"For executed contract review on {subject['address']} in {subd_label}, the sales comparison grid establishes "
+            f"an adjusted value range of ${min_ind:,.0f} to ${max_ind:,.0f} (midpoint ${midpoint:,.0f}) against a statistical "
+            f"hedonic benchmark of ${benchmark:,.0f}. Contracts ratified near or below the corridor midpoint are well-supported "
+            f"by closed neighborhood comparables, whereas contract prices approaching ${max_ind:,.0f} require strong documentary "
+            f"support for condition, upgrades, and net seller concessions."
+        )
+    else:
+        thesis_sentence = (
+            f"The pre-listing market analysis for {subject['address']} in {subd_label} establishes an indicated price range "
+            f"of ${min_ind:,.0f} to ${max_ind:,.0f}, yielding a supported corridor midpoint of ${midpoint:,.0f} against a statistical "
+            f"hedonic benchmark of ${benchmark:,.0f}. Positioning list price near the midpoint aligns with current {subject['county']} County "
+            f"buyer absorption, whereas pricing toward the upper limit (${max_ind:,.0f}) increases days-on-market and lender appraisal-gap risk "
+            f"for a {subject['beds']}-bedroom, {subj_bath_str} residence."
+        )
+
     fallback_narrative = f"""
-    <p><b>Executive Pricing Strategy & Valuation Thesis:</b> 
-    The sales comparison analysis for {subject['address']} in {subject['subdivision']} establishes an indicated price corridor 
-    of ${min_ind:,.0f} to ${max_ind:,.0f}, yielding a supported corridor midpoint of ${midpoint:,.0f} against a statistical 
-    hedonic benchmark of ${benchmark:,.0f}. Midpoint pricing represents an appraisal-defensible baseline grounded in direct 
-    neighborhood transactions. Pricing toward the upper corridor limit (${max_ind:,.0f}) introduces appraisal risk, 
-    requiring the subject property's 3-bedroom, 2.1-bath utility to compete directly with larger homes in the immediate market area.
+    <p><b>Executive Pricing Strategy & Market Range Thesis:</b>
+    {thesis_sentence}
     </p>
 
-    <p><b>ANSI Z765 & Functional Utility Bracketing Analysis:</b> 
-    Fannie Mae two-sided bracketing is fully satisfied across gross living area and transaction price. Living area is bracketed between 
-    {min_gla_row['address']} ({int(min_gla_row['gla']):,} SF) and {max_gla_row['address']} ({int(max_gla_row['gla']):,} SF) 
-    surrounding the subject's {subject['gla']:,} SF footprint. Closed sales bracket the property from ${min_p_row['price']:,.0f} 
-    to ${max_p_row['price']:,.0f}, with internal {subject['subdivision']} sales given primary weight.
+    <p><b>ANSI Z765 & Functional Utility Bracketing Analysis:</b>
+    Two-sided physical and price bracketing is satisfied across the selected comparables. Living area is bracketed between
+    {min_gla_row['address']} ({int(min_gla_row['gla']):,} SF) and {max_gla_row['address']} ({int(max_gla_row['gla']):,} SF)
+    around the subject's {subject['gla']:,} SF footprint, while closed sale prices span ${min_p_row['price']:,.0f}
+    to ${max_p_row['price']:,.0f}.
     <br/><br/>
-    <b>Room & Bath Contributory Value Reconciliation:</b> Residual sensitivity and paired analysis demonstrate that the market does not 
-    exhibit a contributory premium for additional bedrooms (4b/5b) or full bathrooms (3.0ba vs. 2.1ba) independent of total living area. 
-    Because buyers in this market segment would not pay a premium for fewer bathrooms, and because the marginal utility of additional 
-    rooms is already reflected in the ${gla_rate:,.2f}/SF gross living area adjustments, separate room line-item adjustments are reconciled at $0. 
-    Applying a separate room adjustment alongside the GLA adjustment would constitute improper double-counting of physical utility under 
-    accepted appraisal standards.
+    <b>Room & Bath Contributory Value Reconciliation:</b> Residual sensitivity analysis indicates that the local market does not
+    assign a separate contributory premium for bedroom count or bathroom count independent of overall living area when comps already
+    match or exceed the subject's {subj_bath_str} utility. Because buyers do not pay a premium for fewer baths, and because marginal room
+    utility is captured within the ${gla_rate:,.2f}/SF gross living area adjustment, separate room adjustments are reconciled at $0 where
+    appropriate to prevent double-counting.
     </p>
     """
 
@@ -367,24 +491,18 @@ def generate_narrative_groq(api_key, subject, reg_params, grid_df):
             "llama-3.3-70b-versatile",
             "llama-3.1-70b-versatile",
             "llama-3.1-8b-instant",
-            "mixtral-8x7b-32768"
         ]
-        chosen_model = next((m for m in preferred_models if m in active_ids), None)
-        if not chosen_model:
-            chat_candidates = [
-                m for m in active_ids 
-                if not any(b in m.lower() for b in ["guard", "whisper", "vision", "embed", "orpheus"])
-            ]
-            chosen_model = chat_candidates[0] if chat_candidates else "llama-3.3-70b-versatile"
+        chosen_model = next((m for m in preferred_models if m in active_ids), "llama-3.3-70b-versatile")
 
         comp_lines = "\n".join([
-            f"- {r['address']} ({r['subdivision']}): {int(r['gla']):,} SF, {r['rooms']}, Closed ${r['price']:,.0f}, Indicated ${r['indicated']:,.0f}"
+            f"- {r['address']} ({r['subdivision']}): {int(r['gla']):,} SF, {r['rooms']}, Closed ${r['price']:,.0f}, TimeAdj ${r['time_adj']:+,.0f}, Indicated ${r['indicated']:,.0f}"
             for _, r in grid_df.iterrows()
         ])
 
         prompt = f"""
-SUBJECT PROPERTY: {subject['address']}, Raleigh, NC ({subject['subdivision']}) | GLA: {subject['gla']:,} SF | {subject['beds']}b/{subject['baths_full']}.{subject['baths_half']}ba
-Hedonic Benchmark: ${benchmark:,.0f} | Reconciled Corridor: ${min_ind:,.0f} to ${max_ind:,.0f} (Midpoint: ${midpoint:,.0f}) | Extracted GLA Rate: ${gla_rate}/SF
+DELIVERABLE MODE: {val_mode}
+SUBJECT PROPERTY: {subject['address']} ({subject['county']} County, NC | {subd_label}) | Built {subject['year_built']} | Condition: {subject['condition']} | GLA: {subject['gla']:,} SF | {subject['beds']}b/{subj_bath_str} | Bsmt Fin: {subject['bsmt_fin']:,} SF
+Hedonic Benchmark: ${benchmark:,.0f} | Indicated Range: ${min_ind:,.0f} to ${max_ind:,.0f} (Midpoint: ${midpoint:,.0f}) | Extracted GLA Rate: ${gla_rate}/SF | Monthly Market Trend: {subject.get('monthly_trend_pct', 0.0)}%
 
 COMPARABLES GRID:
 {comp_lines}
@@ -393,21 +511,24 @@ BRACKETING REFERENCES:
 - Lower GLA Comp: {min_gla_row['address']} ({int(min_gla_row['gla']):,} SF)
 - Upper GLA Comp: {max_gla_row['address']} ({int(max_gla_row['gla']):,} SF)
 
-Write an executive appraisal defense narrative formatted strictly as TWO HTML paragraphs (<p><b>Title:</b> Text</p>):
+Write an executive market pricing & defense brief formatted strictly as TWO HTML paragraphs (<p><b>Title:</b> Text</p>):
 
-1. <p><b>Executive Pricing Strategy & Valuation Thesis:</b> Reconcile corridor (${min_ind:,.0f}-${max_ind:,.0f}), midpoint (${midpoint:,.0f}), and benchmark (${benchmark:,.0f}). Explain why midpoint is defensible and upper limit carries appraisal risk.</p>
+1. <p><b>Executive Pricing Strategy & Market Range Thesis:</b> Tailor this paragraph specifically to "{val_mode}". Reconcile the indicated range (${min_ind:,.0f}-${max_ind:,.0f}), midpoint (${midpoint:,.0f}), and hedonic benchmark (${benchmark:,.0f}) in the context of {subject['county']} County market conditions.</p>
 
-2. <p><b>ANSI Z765 & Functional Utility Bracketing Analysis:</b> Reference the specific lower comp ({min_gla_row['address']}, {int(min_gla_row['gla']):,} SF) and upper comp ({max_gla_row['address']}, {int(max_gla_row['gla']):,} SF) bracketing the subject's {subject['gla']:,} SF. Explain that room/bath adjustments are reconciled at $0 based on sensitivity analysis showing the local market does not pay a contributory premium for extra bedrooms or baths independent of square footage. Detail that market buyers would never pay a premium for fewer bathrooms, and that the ${gla_rate}/SF GLA adjustment already absorbs physical room utility, avoiding double-counting.</p>
+2. <p><b>ANSI Z765 & Functional Utility Bracketing Analysis:</b> Reference {min_gla_row['address']} ({int(min_gla_row['gla']):,} SF) and {max_gla_row['address']} ({int(max_gla_row['gla']):,} SF) bracketing the subject's {subject['gla']:,} SF. Explain how the ${gla_rate}/SF GLA adjustment captures overall living area utility without double-counting bedroom/bath differences.</p>
 
-CRITICAL INSTRUCTIONS:
-- Reference ONLY the specific addresses above.
-- Never assert that all properties share the same square footage.
-- Length: 200 to 260 words total.
+CRITICAL COMPLIANCE & ACCURACY RULES:
+- Do NOT claim this document is an appraisal or written as a licensed appraiser opinion; frame it strictly as an automated statistical market analysis / CMA brief.
+- Reference ONLY the specific addresses listed above.
+- Length: 200 to 250 words total.
 """
         response = client.chat.completions.create(
             model=chosen_model,
             messages=[
-                {"role": "system", "content": "You are a North Carolina real estate appraiser writing an executive listing defense brief under N.C.G.S. § 93A-83. Write concise, defensible prose."},
+                {
+                    "role": "system",
+                    "content": "You are a real estate market data analyst writing a statistical Comparative Market Analysis (CMA) and pricing strategy brief. Never present the output as a USPAP appraisal."
+                },
                 {"role": "user", "content": prompt}
             ],
             temperature=0.2,
@@ -417,16 +538,13 @@ CRITICAL INSTRUCTIONS:
         return sanitize_for_pdf(content) if content else fallback_narrative
     except Exception:
         return fallback_narrative
+
 # ==============================================================================
 # AUDIT-GRADE PDF EXPORT
 # ==============================================================================
-def build_pdf_report(subject, reg_params, grid_df, narrative_text):
+def build_pdf_report(subject: dict, reg_params: dict, grid_df: pd.DataFrame, narrative_text: str) -> BytesIO:
     clean_narrative = sanitize_for_pdf(narrative_text)
-    
     clean_narrative = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', clean_narrative)
-    clean_narrative = re.sub(r'^\s*\*\s+(.*?)$', r'<li>\1</li>', clean_narrative, flags=re.MULTILINE)
-    if '<li>' in clean_narrative and '<ul>' not in clean_narrative:
-        clean_narrative = clean_narrative.replace('<li>', '<ul><li>', 1) + '</ul>'
 
     min_val = int(grid_df['indicated'].min())
     max_val = int(grid_df['indicated'].max())
@@ -434,24 +552,27 @@ def build_pdf_report(subject, reg_params, grid_df, narrative_text):
 
     table_rows_html = ""
     for _, r in grid_df.iterrows():
+        time_adj_str = f"${r['time_adj']:+,.0f}" if r['time_adj'] != 0 else "$0"
         gla_adj_str = f"${r['gla_adj']:+,.0f}" if r['gla_adj'] != 0 else "$0"
         rm_adj_str = f"${r['room_adj']:+,.0f}" if r['room_adj'] != 0 else "$0"
-        gar_adj_str = f"${r['gar_adj']:+,.0f}" if r['gar_adj'] != 0 else "$0"
+        other_combined = r['gar_adj'] + r['bsmt_adj'] + r['other_adj']
+        other_adj_str = f"${other_combined:+,.0f}" if other_combined != 0 else "$0"
         net_adj_str = f"${r['net_adj']:+,.0f}"
 
         table_rows_html += f"""
         <tr>
             <td style="text-align: left; font-weight: bold; padding: 4px 3px;">
-                {r['address']}<br/>
-                <span style="font-size: 6.5pt; color: #475569; font-weight: normal;">MLS #{r['mls']} • {r['subdivision']}</span>
+                {sanitize_for_pdf(r['address'])}<br/>
+                <span style="font-size: 6.5pt; color: #475569; font-weight: normal;">ID: {r['mls']} | {sanitize_for_pdf(r['subdivision'])}</span>
             </td>
             <td style="white-space: nowrap;">${r['price']:,.0f}</td>
             <td style="white-space: nowrap;">{r['contract_date']}</td>
             <td style="white-space: nowrap;">{int(r['gla']):,} SF</td>
             <td style="white-space: nowrap;">{r['rooms']}</td>
+            <td style="white-space: nowrap;">{time_adj_str}</td>
             <td style="white-space: nowrap;">{gla_adj_str}</td>
             <td style="white-space: nowrap;">{rm_adj_str}</td>
-            <td style="white-space: nowrap;">{gar_adj_str}</td>
+            <td style="white-space: nowrap;">{other_adj_str}</td>
             <td style="white-space: nowrap;">
                 {net_adj_str}<br/>
                 <span style="font-size: 6pt; color: #64748B;">({r['gross_pct']}% gr / {r['net_pct']}% net)</span>
@@ -468,152 +589,64 @@ def build_pdf_report(subject, reg_params, grid_df, narrative_text):
     <head>
         <meta charset="utf-8">
         <style>
-            @page {{
-                size: letter portrait;
-                margin: 0.35in 0.4in;
-            }}
-            body {{
-                font-family: Helvetica, Arial, sans-serif;
-                font-size: 8pt;
-                line-height: 1.3;
-                color: #1E293B;
-            }}
-            .header-bar {{
-                background-color: #1E3A8A;
-                color: #ffffff;
-                padding: 8px 12px;
-                margin-bottom: 6px;
-            }}
-            .header-title {{
-                font-size: 13pt;
-                font-weight: bold;
-                margin: 0;
-            }}
-            .header-sub {{
-                font-size: 7.5pt;
-                color: #E2E8F0;
-                margin-top: 2px;
-            }}
-            .disclaimer {{
-                font-size: 6pt;
-                color: #475569;
-                background-color: #F8FAFC;
-                padding: 4px 8px;
-                border-left: 3px solid #94A3B8;
-                margin-bottom: 8px;
-            }}
-            .section-title {{
-                font-size: 9pt;
-                font-weight: bold;
-                color: #1E3A8A;
-                border-bottom: 1px solid #CBD5E1;
-                padding-bottom: 2px;
-                margin-top: 8px;
-                margin-bottom: 5px;
-            }}
-            .narrative-box {{
-                font-size: 7.5pt;
-                line-height: 1.25;
-                text-align: justify;
-                margin-bottom: 8px;
-            }}
-            .narrative-box p {{
-                margin: 0 0 4px 0;
-            }}
-            .narrative-box ul {{
-                margin: 2px 0 4px 14px;
-                padding: 0;
-            }}
-            .narrative-box li {{
-                margin-bottom: 2px;
-            }}
-            table.comp-grid {{
-                width: 100%;
-                border-collapse: collapse;
-                margin-top: 4px;
-                margin-bottom: 6px;
-                font-size: 7pt;
-            }}
-            table.comp-grid th {{
-                background-color: #F1F5F9;
-                color: #0F172A;
-                font-weight: bold;
-                padding: 4px 2px;
-                border: 0.5pt solid #CBD5E1;
-                text-align: center;
-            }}
-            table.comp-grid td {{
-                padding: 3px 2px;
-                border: 0.5pt solid #E2E8F0;
-                text-align: center;
-                vertical-align: middle;
-            }}
-            .kpi-table {{
-                width: 100%;
-                margin-bottom: 6px;
-            }}
-            .kpi-box {{
-                background-color: #F8FAFC;
-                border: 0.5pt solid #CBD5E1;
-                padding: 4px;
-                text-align: center;
-            }}
-            .kpi-val {{
-                font-size: 10.5pt;
-                font-weight: bold;
-                color: #1E3A8A;
-            }}
-            .kpi-lbl {{
-                font-size: 6pt;
-                color: #64748B;
-                text-transform: uppercase;
-                font-weight: bold;
-            }}
-            .page-break {{
-                page-break-before: always;
-            }}
+            @page {{ size: letter portrait; margin: 0.35in 0.4in; }}
+            body {{ font-family: Helvetica, Arial, sans-serif; font-size: 8pt; line-height: 1.3; color: #1E293B; }}
+            .header-bar {{ background-color: #1E3A8A; color: #ffffff; padding: 8px 12px; margin-bottom: 6px; }}
+            .header-title {{ font-size: 13pt; font-weight: bold; margin: 0; }}
+            .header-sub {{ font-size: 7.5pt; color: #E2E8F0; margin-top: 2px; }}
+            .disclaimer {{ font-size: 6pt; color: #334155; background-color: #F8FAFC; padding: 5px 8px; border-left: 3px solid #1E3A8A; margin-bottom: 8px; }}
+            .section-title {{ font-size: 9pt; font-weight: bold; color: #1E3A8A; border-bottom: 1px solid #CBD5E1; padding-bottom: 2px; margin-top: 8px; margin-bottom: 5px; }}
+            .narrative-box {{ font-size: 7.5pt; line-height: 1.28; text-align: justify; margin-bottom: 8px; }}
+            .narrative-box p {{ margin: 0 0 5px 0; }}
+            table.comp-grid {{ width: 100%; border-collapse: collapse; margin-top: 4px; margin-bottom: 6px; font-size: 6.8pt; }}
+            table.comp-grid th {{ background-color: #F1F5F9; color: #0F172A; font-weight: bold; padding: 4px 2px; border: 0.5pt solid #CBD5E1; text-align: center; }}
+            table.comp-grid td {{ padding: 3px 2px; border: 0.5pt solid #E2E8F0; text-align: center; vertical-align: middle; }}
+            .kpi-table {{ width: 100%; margin-bottom: 6px; }}
+            .kpi-box {{ background-color: #F8FAFC; border: 0.5pt solid #CBD5E1; padding: 4px; text-align: center; }}
+            .kpi-val {{ font-size: 10pt; font-weight: bold; color: #1E3A8A; }}
+            .kpi-lbl {{ font-size: 6pt; color: #64748B; text-transform: uppercase; font-weight: bold; }}
+            .cta-box {{ margin-top: 10px; padding: 6px 8px; background-color: #EFF6FF; border: 0.5pt solid #BFDBFE; font-size: 7pt; color: #1E3A8A; }}
         </style>
     </head>
     <body>
         <div class="header-bar">
-            <div class="header-title">Executive Listing Defense Brief & Valuation Packet</div>
-            <div class="header-sub">Subject: {subject['address']} | Subdivision: {subject['subdivision']} | Valuation Date: {subject['val_date']}</div>
+            <div class="header-title">Automated Market Range &amp; Listing Defense Brief ({subject['val_mode']})</div>
+            <div class="header-sub">Subject: {sanitize_for_pdf(subject['address'])} | County: {subject['county']} | Subdivision: {sanitize_for_pdf(subject['subdivision'] or 'Submarket')} | Date: {subject['val_date']}</div>
         </div>
 
         <div class="disclaimer">
-            <strong>REGULATORY & LEGAL DISCLAIMER (N.C.G.S. § 93A-83):</strong> This document is a computer-assisted Comparative Market Analysis (CMA) and Listing Defense Brief prepared solely for transaction consultation and listing defense. THIS IS NOT AN OFFICIAL APPRAISAL and has not been developed in accordance with USPAP standards.
+            <strong>IMPORTANT NOTICE &amp; USPAP ADVISORY OPINION 18 DISCLOSURE:</strong> THIS IS NOT AN APPRAISAL. This report is an automated software-generated market analysis and Comparative Market Analysis (CMA) prepared for informational and transaction consultation purposes only. It has not been developed in accordance with the Uniform Standards of Professional Appraisal Practice (USPAP) and does not represent an opinion of value by a licensed or certified real estate appraiser. If you require a formal USPAP-compliant appraisal for mortgage lending, equitable distribution (divorce), estate/probate tax filing, or property tax appeal, please contact our office to engage a formal appraisal assignment.
         </div>
 
         <table class="kpi-table">
             <tr>
                 <td class="kpi-box"><div class="kpi-lbl">Statistical Benchmark</div><div class="kpi-val">${reg_params['benchmark']:,.0f}</div></td>
-                <td class="kpi-box"><div class="kpi-lbl">Corridor Midpoint</div><div class="kpi-val">${midpoint:,.0f}</div></td>
-                <td class="kpi-box"><div class="kpi-lbl">Supported Corridor</div><div class="kpi-val">${min_val:,.0f} - ${max_val:,.0f}</div></td>
-                <td class="kpi-box"><div class="kpi-lbl">GLA Adjustment Rate</div><div class="kpi-val">${reg_params['gla_rate']}/SF</div></td>
+                <td class="kpi-box"><div class="kpi-lbl">Indicated Midpoint</div><div class="kpi-val">${midpoint:,.0f}</div></td>
+                <td class="kpi-box"><div class="kpi-lbl">Indicated Value Range</div><div class="kpi-val">${min_val:,.0f} - ${max_val:,.0f}</div></td>
+                <td class="kpi-box"><div class="kpi-lbl">Model GLA Rate</div><div class="kpi-val">${reg_params['gla_rate']}/SF</div></td>
             </tr>
         </table>
 
-        <div class="section-title">1. Executive Pricing Strategy & Valuation Narrative</div>
+        <div class="section-title">1. Executive Pricing Strategy &amp; Market Narrative</div>
         <div class="narrative-box">
             {clean_narrative}
         </div>
 
-        <div class="page-break"></div>
-
-        <div class="section-title">2. Sales Comparison Approach Reconciliation Grid (ANSI Z765 Bracketing)</div>
+        <div class="section-title">2. Sales Comparison Model Grid (ANSI Z765 Bracketing)</div>
         <table class="comp-grid">
             <thead>
                 <tr>
-                    <th style="width: 25%; text-align: left;">Comparable Property</th>
+                    <th style="width: 23%; text-align: left;">Comparable Property</th>
                     <th style="width: 8%;">Closed Price</th>
-                    <th style="width: 8%;">Date</th>
+                    <th style="width: 7%;">Date</th>
                     <th style="width: 7%;">GLA</th>
-                    <th style="width: 8%;">Beds/Baths</th>
-                    <th style="width: 8%;">GLA Adj ($)</th>
-                    <th style="width: 8%;">Room Adj ($)</th>
-                    <th style="width: 8%;">Garage Adj ($)</th>
-                    <th style="width: 10%;">Net Adj ($)</th>
-                    <th style="width: 10%;">Indicated Value</th>
+                    <th style="width: 7%;">Beds/Baths</th>
+                    <th style="width: 7%;">Time Adj</th>
+                    <th style="width: 7%;">GLA Adj</th>
+                    <th style="width: 7%;">Room Adj</th>
+                    <th style="width: 8%;">Gar/Bsmt/Age</th>
+                    <th style="width: 9%;">Net / Gross</th>
+                    <th style="width: 10%;">Indicated</th>
                 </tr>
             </thead>
             <tbody>
@@ -621,70 +654,155 @@ def build_pdf_report(subject, reg_params, grid_df, narrative_text):
             </tbody>
         </table>
         <div style="font-size: 6.5pt; color: #64748B; margin-top: 4px;">
-            *Note: Living area variances within +/- 100 SF receive a $0 adjustment per ANSI Z765 measurement standards. Comparable selection algorithm prioritizes internal subdivision sales and enforces Fannie Mae two-sided bracketing.
+            *Model Parameters: Living area variances within +/- 100 SF receive $0 per ANSI Z765 standards. Monthly market condition trend applied at {subject.get('monthly_trend_pct', 0.0):+.2f}%/mo. Garage valued at $10,000/bay; net finished basement differential at $50/SF.
+        </div>
+
+        <div class="cta-box">
+            <strong>Need a Certified Appraisal for Court, Estate, Tax Appeal, or Pre-Listing Certainty?</strong> Our firm covers Wake, Durham, Orange, Johnston, Cumberland, Franklin, Chatham, and Granville counties. Contact us to order an independent, USPAP-compliant appraisal report.
         </div>
     </body>
     </html>
     """
 
-    sanitized_html = sanitize_for_pdf(html)
     pdf_buffer = BytesIO()
-    pisa.CreatePDF(sanitized_html, dest=pdf_buffer)
+    pisa.CreatePDF(html, dest=pdf_buffer)
     pdf_buffer.seek(0)
     return pdf_buffer
+
+# ==============================================================================
+# SESSION STATE INITIALIZATION
+# ==============================================================================
+if "active_comps_df" not in st.session_state:
+    st.session_state["active_comps_df"] = None
+if "autofill_subject" not in st.session_state:
+    st.session_state["autofill_subject"] = {}
 
 # ==============================================================================
 # SIDEBAR CONTROLS
 # ==============================================================================
 with st.sidebar:
-    st.header("1. Upload MLS Comps CSV")
-    uploaded_file = st.file_uploader("Upload MLS Search Export (.csv)", type=["csv"])
-    
-    st.header("2. Valuation Mode & Pricing")
-    val_mode = st.radio("Deliverable Strategy Mode:", ["Pre-Listing / CMA Strategy", "Executed Contract Defense"])
-    val_date = st.date_input("Valuation Date:", value=date.today())
-    
-    
+    st.header("1. County & Market Parameters")
+    selected_county = st.selectbox("NC County:", list(NC_COUNTY_CONFIG.keys()), index=0)
+    county_meta = NC_COUNTY_CONFIG[selected_county]
+    st.caption(f"Market Profile: {county_meta['tier']} (Default Radius: {county_meta['default_radius']} mi)")
+
+    search_radius = st.slider(
+        "Comparable Search Radius (Miles):",
+        min_value=0.25,
+        max_value=5.0,
+        value=float(county_meta["default_radius"]),
+        step=0.25
+    )
+    monthly_trend_pct = st.slider(
+        "Monthly Market Condition Trend (%):",
+        min_value=-1.00,
+        max_value=1.00,
+        value=float(county_meta["monthly_trend_pct"]),
+        step=0.05,
+        help="Negative applies downward time adjustments to older closed sales."
+    )
+
+    st.header("2. Deliverable Strategy Mode")
+    val_mode = st.radio("Brief Purpose:", ["Pre-Listing / CMA Strategy", "Executed Contract Defense"])
+    val_date = st.date_input("Effective Analysis Date:", value=date.today())
+
     st.header("3. Comparable Selection Mode")
-    comp_mode = st.radio("Selection Strategy:", ["Algorithmic (Appraisal Bracketing)", "Manual Override (Pick Specific Comps)"])
-    
-    st.header("4. Inference Provider")
-    groq_api_key = st.text_input(
-        "Groq API Key:", 
-        value=st.secrets.get("GROQ_API_KEY", ""), 
+    comp_mode = st.radio("Selection Strategy:", ["Algorithmic (Two-Sided Bracketing)", "Manual Override (Pick Specific Comps)"])
+
+    st.header("4. API Credentials")
+    rentcast_api_key = st.text_input(
+        "RentCast Public Records API Key:",
+        value=os.getenv("RENTCAST_API_KEY", st.secrets.get("RENTCAST_API_KEY", "")),
         type="password",
-        help="Paste your gsk_... key here"
+        help="Required only for Address Lookup without an MLS CSV."
+    )
+    groq_api_key = st.text_input(
+        "Groq Narrative API Key:",
+        value=os.getenv("GROQ_API_KEY", st.secrets.get("GROQ_API_KEY", "")),
+        type="password",
+        help="Optional. Uses deterministic fallback if blank."
     )
 
 # ==============================================================================
-# MAIN INTERFACE: RESTORED 3-COLUMN PARAMETER GRID
+# MAIN INTERFACE: 3-TAB MULTI-COUNTY INTAKE
 # ==============================================================================
-st.markdown('<div class="report-header">Listing Defense Brief & Pricing Engine</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Algorithmic Comparable Selection • OLS Residual Sensitivity • ANSI Z765 & Appraisal Bracketing Compliance</div>', unsafe_allow_html=True)
+st.markdown('<div class="report-header">8-County NC Valuation &amp; Listing Defense Engine</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Wake • Durham • Orange • Johnston • Cumberland • Franklin • Chatham • Granville</div>', unsafe_allow_html=True)
 
-st.subheader("Subject Property Parameters")
+tab_addr, tab_csv, tab_manual = st.tabs([
+    "1. Address Lookup (No MLS Needed)",
+    "2. Upload MLS CSV (Realtors / Internal)",
+    "3. Manual Comp Grid (Fallback)"
+])
+
+with tab_addr:
+    st.markdown("Enter any residential street address across our 8-county coverage area to pull public tax records and nearby closed sales automatically.")
+    lookup_addr = st.text_input("Property Street Address, City, State, ZIP:", value="213 Hillstone Dr, Raleigh, NC 27615")
+    days_lookback = st.selectbox("Sale Lookback Window:", [180, 270, 365, 540], index=2, format_func=lambda d: f"Past {d} Days")
+
+    if st.button("Fetch Public Records & Nearby Sales"):
+        if not rentcast_api_key:
+            st.warning("Enter a RentCast API key in the left sidebar (or use Tab 2 / Tab 3 without an API key).")
+        else:
+            with st.spinner(f"Pulling public records within {search_radius} miles..."):
+                try:
+                    subj_auto, api_df = fetch_comps_from_rentcast(lookup_addr, rentcast_api_key, search_radius, days_lookback)
+                    if api_df.empty:
+                        st.error("No closed comparable sales returned within that radius. Try increasing the Search Radius in the sidebar.")
+                    else:
+                        st.session_state["autofill_subject"] = subj_auto
+                        st.session_state["active_comps_df"] = api_df
+                        st.success(f"Found {len(api_df)} closed sales in {subj_auto['county']} County. Review subject specs below and click Generate.")
+                except Exception as e:
+                    st.error(f"Public records lookup failed: {e}")
+
+with tab_csv:
+    st.markdown("Upload a Doorify / Triangle MLS or Longleaf Pine MLS CSV export.")
+    uploaded_file = st.file_uploader("Upload MLS Search Export (.csv)", type=["csv"])
+    if uploaded_file is not None:
+        csv_df = load_and_clean_csv(uploaded_file)
+        st.session_state["active_comps_df"] = csv_df
+        st.success(f"Loaded {len(csv_df)} market records from MLS CSV.")
+
+with tab_manual:
+    st.markdown("Enter or paste 3 to 6 recent neighborhood sales directly if public records are sparse (e.g., rural acreage in Chatham, Franklin, or Granville).")
+    default_manual = pd.DataFrame([
+        {"MLS #": "COMP-1", "Address": "105 Sample Way", "Clean_Price": 445000.0, "Clean_GLA": 1950.0, "Clean_Bsmt_Fin": 0.0, "Clean_Year": 1992, "Clean_Beds": 3, "Clean_FB": 2, "Clean_HB": 1, "Clean_Subdivision": "Chadwick", "Clean_Date": pd.to_datetime("2026-08-15"), "Clean_Garage": 2.0},
+        {"MLS #": "COMP-2", "Address": "312 Sample Ct", "Clean_Price": 472000.0, "Clean_GLA": 2120.0, "Clean_Bsmt_Fin": 0.0, "Clean_Year": 1994, "Clean_Beds": 4, "Clean_FB": 2, "Clean_HB": 1, "Clean_Subdivision": "Chadwick", "Clean_Date": pd.to_datetime("2026-09-20"), "Clean_Garage": 2.0},
+        {"MLS #": "COMP-3", "Address": "408 Nearby Rd", "Clean_Price": 430000.0, "Clean_GLA": 1880.0, "Clean_Bsmt_Fin": 0.0, "Clean_Year": 1990, "Clean_Beds": 3, "Clean_FB": 2, "Clean_HB": 0, "Clean_Subdivision": "Chadwick", "Clean_Date": pd.to_datetime("2026-07-10"), "Clean_Garage": 2.0},
+    ])
+    edited_manual_df = st.data_editor(default_manual, num_rows="dynamic", use_container_width=True)
+    if st.button("Use Manual Comps Table"):
+        valid_manual = edited_manual_df[edited_manual_df["Clean_Price"] > 20000].copy()
+        valid_manual["Clean_Date"] = pd.to_datetime(valid_manual["Clean_Date"], errors="coerce")
+        st.session_state["active_comps_df"] = valid_manual
+        st.success(f"Loaded {len(valid_manual)} manual comparables into active dataset.")
+
+# ==============================================================================
+# SUBJECT PROPERTY VERIFICATION FORM (AUTO-FILLED FROM API WHEN AVAILABLE)
+# ==============================================================================
+st.divider()
+st.subheader("Verify Subject Property Parameters")
+af = st.session_state.get("autofill_subject", {})
+
 col1, col2, col3 = st.columns(3)
 
 with col1:
-    subj_address = st.text_input("Subject Address:", value="213 Hillstone Dr, Raleigh, NC 27615")
-    subj_subdivision = st.text_input("Subdivision (Leave empty for submarket):", value="Chadwick")
-    subj_year = st.number_input("Year Built:", value=1991, step=1)
-    subj_beds = st.number_input("Above-Grade Bedrooms:", value=3, step=1)
-    subj_bsmt_beds = st.number_input("Basement Bedrooms:", value=0, step=1)
+    subj_address = st.text_input("Subject Address:", value=af.get("address", lookup_addr))
+    subj_subdivision = st.text_input("Subdivision (Leave empty for submarket):", value=af.get("subdivision", "Chadwick"))
+    subj_year = st.number_input("Year Built:", value=int(af.get("year_built", 1991)), step=1)
+    subj_beds = st.number_input("Above-Grade Bedrooms:", value=int(af.get("beds", 3)), step=1)
 
 with col2:
-    subj_gla = st.number_input("Above-Grade Measured GLA (SF):", value=2004, step=10)
+    subj_gla = st.number_input("Above-Grade Measured GLA (SF):", value=int(af.get("gla", 2004)), step=10)
     subj_bsmt_fin = st.number_input("Below-Grade Finished Basement (SF):", value=0, step=50)
-    subj_bsmt_unfin = st.number_input("Below-Grade Unfinished Storage (SF):", value=0, step=50)
-    subj_fb = st.number_input("Above-Grade Full Baths:", value=2, step=1)
-    subj_bsmt_fb = st.number_input("Basement Full Baths:", value=0, step=1)
+    subj_fb = st.number_input("Above-Grade Full Baths:", value=int(af.get("baths_full", 2)), step=1)
+    subj_hb = st.number_input("Above-Grade Half Baths:", value=int(af.get("baths_half", 1)), step=1)
 
 with col3:
-    subj_condition = st.selectbox("Condition Rating:", ["Excellent", "Good", "Average", "Fair"])
+    subj_condition = st.selectbox("Condition Rating:", ["Average", "Good", "Excellent", "Fair"])
     subj_garage = st.number_input("Garage Bays:", value=2, step=1)
     subj_fireplaces = st.number_input("Fireplaces:", value=1, step=1)
-    subj_hb = st.number_input("Above-Grade Half Baths:", value=1, step=1)
-    subj_bsmt_hb = st.number_input("Basement Half Baths:", value=0, step=1)
 
 st.markdown("**Exterior Features & Amenities:**")
 am_cols = st.columns(6)
@@ -703,6 +821,7 @@ with am_cols[5]:
 
 subject_data = {
     "address": subj_address,
+    "county": af.get("county", selected_county),
     "subdivision": subj_subdivision,
     "year_built": subj_year,
     "gla": subj_gla,
@@ -713,8 +832,9 @@ subject_data = {
     "condition": subj_condition,
     "fireplaces": subj_fireplaces,
     "bsmt_fin": subj_bsmt_fin,
-    "bsmt_unfin": subj_bsmt_unfin,
     "val_date": str(val_date),
+    "val_mode": val_mode,
+    "monthly_trend_pct": monthly_trend_pct,
     "amenities": {
         "Front Porch": has_front_porch,
         "Screen Porch": has_screen_porch,
@@ -728,48 +848,56 @@ subject_data = {
 # ==============================================================================
 # EXECUTION WORKFLOW
 # ==============================================================================
-if uploaded_file is not None:
-    df = load_and_clean_data(uploaded_file)
-    st.success(f"Loaded {len(df)} market records from MLS export.")
+active_df = st.session_state.get("active_comps_df")
 
-    reg_params = run_regression_analysis(df, subject_data)
+if active_df is not None and not active_df.empty:
+    reg_params = run_regression_analysis(active_df, subject_data)
 
     manual_ids = []
     if comp_mode == "Manual Override (Pick Specific Comps)":
-        mls_options = df['MLS #'].tolist()
-        format_func = lambda x: f"MLS #{x} - {df[df['MLS #']==x]['Address'].values[0]} (${df[df['MLS #']==x]['Clean_Price'].values[0]:,.0f})"
+        mls_options = active_df['MLS #'].tolist()
+        format_func = lambda x: f"{x} - {active_df[active_df['MLS #']==x]['Address'].values[0]} (${active_df[active_df['MLS #']==x]['Clean_Price'].values[0]:,.0f})"
         manual_ids = st.multiselect("Choose 3 to 4 Preferred Comparables:", mls_options, format_func=format_func)
 
-    if st.button("Generate Listing Defense Brief", type="primary", use_container_width=True):
+    if st.button("Generate Market Range & Defense Brief", type="primary", use_container_width=True):
         mode_key = "manual" if comp_mode == "Manual Override (Pick Specific Comps)" else "algorithmic"
-        comps_df = select_comparables_with_subdivision(df, subject_data, reg_params, mode=mode_key, manual_mls_ids=manual_ids)
-        
+        comps_df = select_comparables_with_subdivision(active_df, subject_data, reg_params, mode=mode_key, manual_mls_ids=manual_ids)
+
         if comps_df.empty:
-            st.error("No valid comparables found in the uploaded dataset.")
+            st.error("No valid comparables matched the selection criteria.")
         else:
             grid_df = calculate_grid_adjustments(comps_df, subject_data, reg_params)
 
-            with st.spinner("Compiling narrative via Groq Cloud..."):
+            with st.spinner("Compiling market narrative..."):
                 narrative = generate_narrative_groq(groq_api_key, subject_data, reg_params, grid_df)
 
-            st.markdown("### Valuation & Grid Defense")
+            min_ind = int(grid_df['indicated'].min())
+            max_ind = int(grid_df['indicated'].max())
+            mid_ind = int((min_ind + max_ind) / 2)
+
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Hedonic Benchmark", f"${reg_params['benchmark']:,.0f}")
+            k2.metric("Indicated Midpoint", f"${mid_ind:,.0f}")
+            k3.metric("Indicated Range", f"${min_ind:,.0f} - ${max_ind:,.0f}")
+            k4.metric("Extracted GLA Rate", f"${reg_params['gla_rate']}/SF")
+
+            st.markdown("### Comparable Sales Adjustment Grid")
             st.dataframe(
-                grid_df[['address', 'subdivision', 'price', 'gla', 'rooms', 'gla_adj', 'room_adj', 'gar_adj', 'net_adj', 'gross_pct', 'indicated']],
+                grid_df[['address', 'subdivision', 'contract_date', 'price', 'gla', 'rooms', 'time_adj', 'gla_adj', 'room_adj', 'gar_adj', 'bsmt_adj', 'other_adj', 'net_adj', 'gross_pct', 'indicated']],
                 use_container_width=True
             )
 
-            with st.expander("Preview Executive Appraisal Narrative", expanded=True):
+            with st.expander("Preview Executive Market Narrative", expanded=True):
                 st.write(narrative, unsafe_allow_html=True)
 
             pdf_bytes = build_pdf_report(subject_data, reg_params, grid_df, narrative)
-            
-            clean_filename = f"Listing_Defense_Brief_{re.sub(r'[^a-zA-Z0-9]', '_', subj_address)}.pdf"
+            clean_filename = f"Market_Brief_{re.sub(r'[^a-zA-Z0-9]', '_', subj_address)}.pdf"
             st.download_button(
-                label="📥 Download Audit-Grade Defense Brief (PDF)",
+                label="📥 Download Market Range & Defense Brief (PDF)",
                 data=pdf_bytes,
                 file_name=clean_filename,
                 mime="application/pdf",
                 use_container_width=True
             )
 else:
-    st.info("Upload your Doorify / Triangle MLS export CSV in the left sidebar to begin.")
+    st.info("Use Tab 1 (Address Lookup), Tab 2 (Upload MLS CSV), or Tab 3 (Manual Comp Grid) above to load comparable sales.")
