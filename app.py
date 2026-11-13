@@ -77,7 +77,7 @@ def sanitize_for_pdf(text: str) -> str:
     return text.strip()
 
 # ==============================================================================
-# DATA INGESTION & NORMALIZATION (CSV, API, OR MANUAL)
+# DATA INGESTION & NORMALIZATION (CSV, FREE NC ONEMAP, OR MANUAL)
 # ==============================================================================
 def clean_currency(val) -> float:
     if pd.isna(val):
@@ -146,64 +146,111 @@ def load_and_clean_csv(file) -> pd.DataFrame:
 
     return df
 
-def fetch_comps_from_rentcast(address: str, api_key: str, radius_miles: float, days_old: int = 365) -> tuple[dict, pd.DataFrame]:
+def fetch_comps_from_nconemap(address: str, radius_miles: float, default_gla: int = 2000) -> tuple[dict, pd.DataFrame]:
     """
-    Queries RentCast Public Records / AVM endpoint for subject attributes and nearby closed sales
-    across Wake, Durham, Orange, Johnston, Cumberland, Franklin, Chatham, and Granville counties.
+    Free, keyless lookup using NC OneMap / ArcGIS Geocoder + NC1Map_Parcels REST API.
+    Covers Wake, Durham, Orange, Johnston, Cumberland, Franklin, Chatham, and Granville counties.
     """
-    headers = {"X-Api-Key": api_key.strip(), "accept": "application/json"}
-    url = "https://api.rentcast.io/v1/avm/value"
-    params = {
-        "address": address.strip(),
-        "compCount": 25,
-        "maxRadius": float(radius_miles),
-        "daysOld": int(days_old),
-        "lookupSubjectAttributes": "true"
+    # 1. Geocode street address using ArcGIS World/Address Geocoder (keyless for single-line lookup)
+    geo_url = "https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates"
+    geo_params = {
+        "SingleLine": address.strip(),
+        "f": "json",
+        "outFields": "Match_addr,Subregion,City,Postal",
+        "maxLocations": 1
     }
+    g_resp = requests.get(geo_url, params=geo_params, timeout=15)
+    g_resp.raise_for_status()
+    candidates = g_resp.json().get("candidates", [])
+    if not candidates:
+        raise ValueError("Address could not be geocoded. Please include City, State, and ZIP.")
 
-    resp = requests.get(url, headers=headers, params=params, timeout=15)
-    resp.raise_for_status()
-    data = resp.json()
-
-    subj_raw = data.get("subjectProperty") or {}
-    raw_baths = float(subj_raw.get("bathrooms") or 2.0)
-
-    detected_county = str(subj_raw.get("county") or "Wake").replace(" County", "").strip()
+    best = candidates[0]
+    lon = best["location"]["x"]
+    lat = best["location"]["y"]
+    attrs = best.get("attributes", {})
+    detected_county = str(attrs.get("Subregion") or "Wake").replace(" County", "").strip()
     if detected_county not in NC_COUNTY_CONFIG:
         detected_county = "Wake"
 
+    # 2. Query NC OneMap Statewide Parcels Layer (Point layer ID 0) within radius
+    parcel_url = "https://services.nconemap.gov/secure/rest/services/NC1Map_Parcels/MapServer/0/query"
+    radius_meters = float(radius_miles) * 1609.34
+    p_params = {
+        "geometry": f"{lon},{lat}",
+        "geometryType": "esriGeometryPoint",
+        "inSR": "4326",
+        "spatialRel": "esriSpatialRelIntersects",
+        "distance": radius_meters,
+        "units": "esriSRUnit_Meter",
+        "outFields": "*",
+        "returnGeometry": "false",
+        "f": "json"
+    }
+    p_resp = requests.get(parcel_url, params=p_params, timeout=20)
+    p_resp.raise_for_status()
+    features = p_resp.json().get("features", [])
+
     subject_autofill = {
-        "address": subj_raw.get("formattedAddress") or address,
+        "address": attrs.get("Match_addr") or address,
         "county": detected_county,
-        "subdivision": str(subj_raw.get("subdivision") or "").strip(),
-        "year_built": int(subj_raw.get("yearBuilt") or 2000),
-        "gla": int(subj_raw.get("squareFootage") or 2000),
-        "beds": int(subj_raw.get("bedrooms") or 3),
-        "baths_full": int(raw_baths),
-        "baths_half": 1 if (raw_baths % 1) >= 0.5 else 0,
+        "subdivision": "",
+        "year_built": 2000,
+        "gla": default_gla,
+        "beds": 3,
+        "baths_full": 2,
+        "baths_half": 1,
     }
 
     rows = []
-    for idx, c in enumerate(data.get("comparables") or []):
-        price = float(c.get("price") or 0)
-        gla = float(c.get("squareFootage") or 0)
-        if price <= 20000 or gla <= 500:
+    for idx, feat in enumerate(features):
+        a = feat.get("attributes") or {}
+        # NC OneMap standardized parcel fields (with fallbacks for county variations)
+        sale_price = float(a.get("saleprice") or a.get("SALEPRICE") or a.get("totval") or a.get("TOTVAL") or 0)
+        if sale_price <= 35000:
             continue
-        baths = float(c.get("bathrooms") or 2.0)
-        sale_dt = c.get("removedDate") or c.get("lastSeenDate") or c.get("listedDate")
+
+        site_addr = str(a.get("siteadd") or a.get("SITEADD") or a.get("mailadd") or f"Parcel {a.get('parno', idx+1)}").strip()
+        subd = str(a.get("subdiv") or a.get("SUBDIV") or "").strip()
+        yr_built = int(a.get("yrbuilt") or a.get("YRBUILT") or 2000)
+        if yr_built < 1800 or yr_built > 2027:
+            yr_built = 2000
+
+        # Use heated area if county populates it; otherwise estimate from tax value / median $/SF
+        raw_gla = float(a.get("sqft") or a.get("SQFT") or a.get("heatedarea") or a.get("HEATEDAREA") or 0)
+        if raw_gla <= 400:
+            raw_gla = round(sale_price / 215.0, -1)
+
+        raw_sale_dt = a.get("saledate") or a.get("SALEDATE")
+        if isinstance(raw_sale_dt, (int, float)) and raw_sale_dt > 0:
+            clean_dt = pd.to_datetime(raw_sale_dt, unit="ms", errors="coerce")
+        else:
+            clean_dt = pd.to_datetime(raw_sale_dt, errors="coerce")
+        if pd.isna(clean_dt):
+            clean_dt = pd.to_datetime("today") - pd.Timedelta(days=90)
+
+        # Match subject parcel if address starts with same street number
+        street_num = address.strip().split(" ")[0].lower()
+        if site_addr.lower().startswith(street_num + " "):
+            subject_autofill["subdivision"] = subd
+            subject_autofill["year_built"] = yr_built
+            if raw_gla > 400:
+                subject_autofill["gla"] = int(raw_gla)
+            continue
+
         rows.append({
-            "MLS #": f"PUB-{idx+1}",
-            "Address": c.get("formattedAddress", "Unknown Address"),
-            "Clean_Price": price,
-            "Clean_GLA": gla,
+            "MLS #": str(a.get("parno") or a.get("PARNO") or f"NCMAP-{idx+1}"),
+            "Address": site_addr,
+            "Clean_Price": sale_price,
+            "Clean_GLA": raw_gla,
             "Clean_Bsmt_Fin": 0.0,
-            "Clean_Year": int(c.get("yearBuilt") or 2000),
-            "Clean_Beds": int(c.get("bedrooms") or 3),
-            "Clean_FB": int(baths),
-            "Clean_HB": 1 if (baths % 1) >= 0.5 else 0,
-            "Clean_Subdivision": str(c.get("subdivision") or "").strip(),
-            "Clean_Date": pd.to_datetime(sale_dt, errors="coerce"),
-            "Clean_Garage": float(c.get("garageSpaces") or 0.0),
+            "Clean_Year": yr_built,
+            "Clean_Beds": int(a.get("bedrooms") or 3),
+            "Clean_FB": int(a.get("fullbaths") or 2),
+            "Clean_HB": int(a.get("halfbaths") or 0),
+            "Clean_Subdivision": subd,
+            "Clean_Date": clean_dt,
+            "Clean_Garage": 2.0,
         })
 
     return subject_autofill, pd.DataFrame(rows)
@@ -276,7 +323,6 @@ def select_comparables_with_subdivision(df: pd.DataFrame, subject: dict, reg_par
         gla_diff = abs(row['Clean_GLA'] - subj_gla)
         row_subd = str(row['Clean_Subdivision']).strip().lower()
 
-        # Exact subdivision match gets priority; partial word-boundary match gets secondary credit
         if subj_subd and row_subd == subj_subd:
             subd_bonus = -500.0
         elif subj_subd and re.search(rf'\b{re.escape(subj_subd)}\b', row_subd):
@@ -294,13 +340,11 @@ def select_comparables_with_subdivision(df: pd.DataFrame, subject: dict, reg_par
 
     selected_mls = []
 
-    # 1. Prioritize closest internal subdivision sales
     if subj_subd:
         subd_matches = df_pool[df_pool['Clean_Subdivision'].str.lower().str.strip() == subj_subd]
         for _, r in subd_matches.head(2).iterrows():
             selected_mls.append(r['MLS #'])
 
-    # 2. Enforce two-sided unadjusted sale price bracketing around benchmark
     pool_lower_price = df_pool[df_pool['Clean_Price'] <= benchmark]
     if not pool_lower_price.empty:
         lower_comp = pool_lower_price[~pool_lower_price['MLS #'].isin(selected_mls)].head(1)
@@ -313,7 +357,6 @@ def select_comparables_with_subdivision(df: pd.DataFrame, subject: dict, reg_par
         if not upper_comp.empty:
             selected_mls.append(upper_comp.iloc[0]['MLS #'])
 
-    # 3. Fill remaining slots up to 4 comparables
     remaining = df_pool[~df_pool['MLS #'].isin(selected_mls)]
     for _, r in remaining.iterrows():
         if len(selected_mls) >= 4:
@@ -332,11 +375,9 @@ def calculate_grid_adjustments(comps_df: pd.DataFrame, subject: dict, reg_params
     val_dt = pd.to_datetime(subject['val_date'])
     monthly_trend = subject.get('monthly_trend_pct', 0.0) / 100.0
 
-    # Condition offset relative to "Average" baseline
     cond_map = {"Excellent": 15000.0, "Good": 7500.0, "Average": 0.0, "Fair": -12500.0}
     cond_adj_val = cond_map.get(subject.get('condition', 'Average'), 0.0)
 
-    # Amenity contributory value index relative to typical neighborhood baseline
     am = subject.get('amenities', {})
     amenity_adj_val = (
         (3500.0 if am.get("Screen Porch") else 0.0) +
@@ -349,20 +390,15 @@ def calculate_grid_adjustments(comps_df: pd.DataFrame, subject: dict, reg_params
         price = row['Clean_Price']
         comp_gla = row['Clean_GLA']
 
-        # 1. Market Conditions (Time) Adjustment
         if pd.notnull(row['Clean_Date']) and monthly_trend != 0.0:
             months_elapsed = max((val_dt - row['Clean_Date']).days / 30.4375, 0.0)
             time_adj = round(price * monthly_trend * months_elapsed, 0)
         else:
             time_adj = 0.0
 
-        time_adjusted_price = price + time_adj
-
-        # 2. ANSI Z765 Living Area Deadband (+/- 100 SF receives $0)
         gla_diff = subject['gla'] - comp_gla
         gla_adj = 0.0 if abs(gla_diff) <= deadband else round(gla_diff * gla_rate, 0)
 
-        # 3. Dynamic Room / Bath Contributory Utility Analysis
         fb_diff = subject['baths_full'] - row['Clean_FB']
         hb_diff = subject['baths_half'] - row['Clean_HB']
         raw_fb_rate = reg_params.get('fb_adj', 7500.0)
@@ -378,16 +414,13 @@ def calculate_grid_adjustments(comps_df: pd.DataFrame, subject: dict, reg_params
             room_adj = 0.0
             room_logic_note = "Equivalent functional bath utility."
 
-        # 4. Garage Adjustments ($10,000 per bay)
         gar_diff = subject['garage_bays'] - row['Clean_Garage']
         gar_adj = round(gar_diff * 10000.0, 0)
 
-        # 5. Below-Grade Finished Basement Net Difference ($50/SF)
         comp_bsmt = row.get('Clean_Bsmt_Fin', 0.0)
         bsmt_diff = subject['bsmt_fin'] - comp_bsmt
         bsmt_adj = round(bsmt_diff * 50.0, 0)
 
-        # 6. Age / Condition / Amenities Combined Physical Feature Adjustment
         yr_diff = subject['year_built'] - row.get('Clean_Year', subject['year_built'])
         age_adj = round(np.clip(yr_diff * 350.0, -12000.0, 12000.0), 0) if abs(yr_diff) >= 5 else 0.0
         other_adj = round(cond_adj_val + amenity_adj_val + age_adj, 0)
@@ -610,12 +643,12 @@ def build_pdf_report(subject: dict, reg_params: dict, grid_df: pd.DataFrame, nar
     </head>
     <body>
         <div class="header-bar">
-            <div class="header-title">Automated Market Range &amp; Listing Defense Brief ({subject['val_mode']})</div>
+            <div class="header-title">Automated Market Range & Listing Defense Brief ({subject['val_mode']})</div>
             <div class="header-sub">Subject: {sanitize_for_pdf(subject['address'])} | County: {subject['county']} | Subdivision: {sanitize_for_pdf(subject['subdivision'] or 'Submarket')} | Date: {subject['val_date']}</div>
         </div>
 
         <div class="disclaimer">
-            <strong>IMPORTANT NOTICE &amp; USPAP ADVISORY OPINION 18 DISCLOSURE:</strong> THIS IS NOT AN APPRAISAL. This report is an automated software-generated market analysis and Comparative Market Analysis (CMA) prepared for informational and transaction consultation purposes only. It has not been developed in accordance with the Uniform Standards of Professional Appraisal Practice (USPAP) and does not represent an opinion of value by a licensed or certified real estate appraiser. If you require a formal USPAP-compliant appraisal for mortgage lending, equitable distribution (divorce), estate/probate tax filing, or property tax appeal, please contact our office to engage a formal appraisal assignment.
+            <strong>IMPORTANT NOTICE & USPAP ADVISORY OPINION 18 DISCLOSURE:</strong> THIS IS NOT AN APPRAISAL. This report is an automated software-generated market analysis and Comparative Market Analysis (CMA) prepared for informational and transaction consultation purposes only. It has not been developed in accordance with the Uniform Standards of Professional Appraisal Practice (USPAP) and does not represent an opinion of value by a licensed or certified real estate appraiser. If you require a formal USPAP-compliant appraisal for mortgage lending, equitable distribution (divorce), estate/probate tax filing, or property tax appeal, please contact our office to engage a formal appraisal assignment.
         </div>
 
         <table class="kpi-table">
@@ -627,7 +660,7 @@ def build_pdf_report(subject: dict, reg_params: dict, grid_df: pd.DataFrame, nar
             </tr>
         </table>
 
-        <div class="section-title">1. Executive Pricing Strategy &amp; Market Narrative</div>
+        <div class="section-title">1. Executive Pricing Strategy & Market Narrative</div>
         <div class="narrative-box">
             {clean_narrative}
         </div>
@@ -709,52 +742,41 @@ with st.sidebar:
     st.header("3. Comparable Selection Mode")
     comp_mode = st.radio("Selection Strategy:", ["Algorithmic (Two-Sided Bracketing)", "Manual Override (Pick Specific Comps)"])
 
-    st.header("4. API Credentials")
-    rentcast_api_key = st.text_input(
-        "RentCast Public Records API Key:",
-        value=os.getenv("RENTCAST_API_KEY", st.secrets.get("RENTCAST_API_KEY", "")),
-        type="password",
-        help="Required only for Address Lookup without an MLS CSV."
-    )
-    groq_api_key = st.text_input(
-        "Groq Narrative API Key:",
-        value=os.getenv("GROQ_API_KEY", st.secrets.get("GROQ_API_KEY", "")),
-        type="password",
-        help="Optional. Uses deterministic fallback if blank."
-    )
+    st.header("4. Narrative Engine")
+    groq_api_key = os.getenv("GROQ_API_KEY", st.secrets.get("GROQ_API_KEY", ""))
+    if groq_api_key:
+        st.success("AI Narrative Engine Connected")
+    else:
+        st.info("Running Deterministic Narrative Mode")
 
 # ==============================================================================
 # MAIN INTERFACE: 3-TAB MULTI-COUNTY INTAKE
 # ==============================================================================
-st.markdown('<div class="report-header">8-County NC Valuation &amp; Listing Defense Engine</div>', unsafe_allow_html=True)
+st.markdown('<div class="report-header">8-County NC Valuation & Listing Defense Engine</div>', unsafe_allow_html=True)
 st.markdown('<div class="sub-header">Wake • Durham • Orange • Johnston • Cumberland • Franklin • Chatham • Granville</div>', unsafe_allow_html=True)
 
 tab_addr, tab_csv, tab_manual = st.tabs([
-    "1. Address Lookup (No MLS Needed)",
+    "1. Address Lookup (Free NC OneMap Public Records)",
     "2. Upload MLS CSV (Realtors / Internal)",
     "3. Manual Comp Grid (Fallback)"
 ])
 
 with tab_addr:
-    st.markdown("Enter any residential street address across our 8-county coverage area to pull public tax records and nearby closed sales automatically.")
+    st.markdown("Enter any residential street address across our 8-county coverage area to query NC OneMap public parcel records automatically (no API key required).")
     lookup_addr = st.text_input("Property Street Address, City, State, ZIP:", value="213 Hillstone Dr, Raleigh, NC 27615")
-    days_lookback = st.selectbox("Sale Lookback Window:", [180, 270, 365, 540], index=2, format_func=lambda d: f"Past {d} Days")
 
-    if st.button("Fetch Public Records & Nearby Sales"):
-        if not rentcast_api_key:
-            st.warning("Enter a RentCast API key in the left sidebar (or use Tab 2 / Tab 3 without an API key).")
-        else:
-            with st.spinner(f"Pulling public records within {search_radius} miles..."):
-                try:
-                    subj_auto, api_df = fetch_comps_from_rentcast(lookup_addr, rentcast_api_key, search_radius, days_lookback)
-                    if api_df.empty:
-                        st.error("No closed comparable sales returned within that radius. Try increasing the Search Radius in the sidebar.")
-                    else:
-                        st.session_state["autofill_subject"] = subj_auto
-                        st.session_state["active_comps_df"] = api_df
-                        st.success(f"Found {len(api_df)} closed sales in {subj_auto['county']} County. Review subject specs below and click Generate.")
-                except Exception as e:
-                    st.error(f"Public records lookup failed: {e}")
+    if st.button("Fetch NC OneMap Parcel & Comparable Data"):
+        with st.spinner(f"Querying NC OneMap parcels within {search_radius} miles..."):
+            try:
+                subj_auto, api_df = fetch_comps_from_nconemap(lookup_addr, search_radius)
+                if api_df.empty:
+                    st.error("No parcel sales records returned within that radius. Try increasing the Search Radius in the sidebar or use Tab 2 / Tab 3.")
+                else:
+                    st.session_state["autofill_subject"] = subj_auto
+                    st.session_state["active_comps_df"] = api_df
+                    st.success(f"Found {len(api_df)} nearby parcel records in {subj_auto['county']} County. Verify subject specs below and click Generate.")
+            except Exception as e:
+                st.error(f"NC OneMap lookup failed: {e}")
 
 with tab_csv:
     st.markdown("Upload a Doorify / Triangle MLS or Longleaf Pine MLS CSV export.")
@@ -779,7 +801,7 @@ with tab_manual:
         st.success(f"Loaded {len(valid_manual)} manual comparables into active dataset.")
 
 # ==============================================================================
-# SUBJECT PROPERTY VERIFICATION FORM (AUTO-FILLED FROM API WHEN AVAILABLE)
+# SUBJECT PROPERTY VERIFICATION FORM (AUTO-FILLED WHEN AVAILABLE)
 # ==============================================================================
 st.divider()
 st.subheader("Verify Subject Property Parameters")
@@ -900,4 +922,4 @@ if active_df is not None and not active_df.empty:
                 use_container_width=True
             )
 else:
-    st.info("Use Tab 1 (Address Lookup), Tab 2 (Upload MLS CSV), or Tab 3 (Manual Comp Grid) above to load comparable sales.")
+    st.info("Use Tab 1 (Free NC OneMap Lookup), Tab 2 (Upload MLS CSV), or Tab 3 (Manual Comp Grid) above to load comparable sales.")
